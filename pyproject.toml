@@ -1,0 +1,36 @@
+[project]
+name = "ngm-daq"
+dynamic = ["version"]   # from ngm_daq.__version__
+description = "FastLog data acquisition GUI for Rohde & Schwarz NGM201/NGM202 power supplies over LAN"
+requires-python = ">=3.12"
+# Minimum versions are the ones this was tested with; uv.lock pins the exact set (uv sync).
+dependencies = [
+    "h5py>=3.16",          # HDF5 export
+    "numpy>=2.5",
+    "pyqtgraph>=0.14",
+    "PyQt6>=6.11",
+    "RsInstrument>=1.131", # R&S instrument driver; its socket mode needs no VISA installation
+    "pyvisa>=1.16",
+    "pyvisa-py>=0.8",      # pure-Python VISA for HiSLIP/VXI-11 and Scan when no R&S VISA is installed
+    "zeroconf>=0.151",     # lets pyvisa-py discover HiSLIP instruments via mDNS
+    "psutil>=7.2",         # network interfaces for VXI-11 discovery; available memory for capture sizing
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+ngm-daq = "ngm_daq.gui:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ngm_daq"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ngm_daq.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
