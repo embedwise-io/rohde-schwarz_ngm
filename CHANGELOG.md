@@ -2,6 +2,36 @@
 
 Notable changes to R&S NGM FastLog. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-10-19
+
+### Changed
+
+- **Output switch.** Each channel's output is a two-position OFF / ON switch instead of a
+  button labelled with its state, so it's clear that clicking it switches the output.
+- **Connecting only reads.** Channel settings (measurement ranges) are no longer remembered
+  between sessions. The channel panels show "—" until the app connects, then show the
+  instrument's setpoints, output states and ranges, and keep following changes made on the
+  front panel. Ranges are applied when you choose them.
+
+### Fixed
+
+- **Stale setpoint sent.** A setpoint field that had keyboard focus when the instrument's
+  values arrived kept its old value (e.g. 0.000 V), and leaving the field then sent that value
+  to the instrument. Fields now send only values you typed or stepped.
+- **Accidental setpoint changes.** The mouse wheel no longer changes a setpoint field you
+  scroll past; click into the field first.
+- **Plots out of line with the time axis.** Each plot's y axis took the width of its widest
+  tick label, so a plot whose labels had more digits (or gained decimals when zooming) had
+  its plot area shifted sideways, and the times on it no longer lined up with the time axis
+  under the bottom plot. The y axes now have a fixed width with room for 8 significant digits,
+  so the plots always line up and don't move when zooming. Tick labels never show more digits
+  than fit.
+
+### Also
+
+- Tests for the main window against the simulator check that connecting sends no setting
+  commands, and that the plot areas stay aligned (40 tests in total).
+
 ## [0.1.0] — 2026-10-18
 
 First version, for review: a desktop GUI and Python driver for FastLog voltage and current

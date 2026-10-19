@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +28,8 @@ from .instrument import (
     CHUNK_PERIOD, CURRENT_MIN, CURRENT_RANGES, MAX_TOTAL_RATE, PROTOCOLS, VOLTAGE_MAX, VOLTAGE_RANGES,
     ChannelSetup, ChannelStatus, DeviceInfo, SampleRate, connection_for, format_rate, max_current, range_label,
 )
-from .plotting import STYLES, Bands, EnvelopeCurve
+from .plotting import STYLES, Bands, EnvelopeCurve, ValueAxis
+from .widgets import SetpointSpinBox, ToggleSwitch
 from .worker import InstrumentWorker
 
 APP_NAME = "R&S NGM FastLog"
@@ -40,6 +42,7 @@ EVENT_CONTEXT = 0.002                              # s: minimum view width when 
 MEMORY_FRACTION = 0.5                              # of available RAM that captures may use
 BYTES_PER_SAMPLE = 8 + 3 * 2 * 4 / PYRAMID_BASE * PYRAMID_FACTOR / (PYRAMID_FACTOR - 1)   # V, I + pyramids
 DEFAULT_DURATION = 2.0
+PENDING_TIMEOUT = 2.0                              # s a control shows a request before the instrument confirms it
 
 
 def si(value: float, unit: str, precision: int = 5) -> str:
@@ -61,12 +64,18 @@ def colored(text: str, ch: int) -> str:
 
 
 class ChannelPanel(QGroupBox):
-    """Setpoints, output switch, live readback and measurement ranges of one channel."""
+    """Setpoints, output switch, live readback and measurement ranges of one channel.
+
+    Everything shown comes from the instrument: nothing is sent until the user changes a control,
+    and the controls follow changes made on the front panel. A change the user just made is shown
+    until the instrument reports it (or PENDING_TIMEOUT passes), so a status read that was already
+    under way can't flip the control back.
+    """
 
     voltage_requested = Signal(int, float)
     current_requested = Signal(int, float)
     output_requested = Signal(int, bool)
-    ranges_requested = Signal(int)
+    ranges_requested = Signal(int, object, object)     # channel, voltage range, current range (None = auto)
     measure_changed = Signal()
 
     def __init__(self, ch: int):
@@ -77,29 +86,33 @@ class ChannelPanel(QGroupBox):
         self._connected = False
         self._running = False
         self._has_ranges = True
+        self._pending: dict[str, tuple[object, float]] = {}     # control -> (requested value, deadline)
         form = QFormLayout(self)
 
         self.measure = QCheckBox("Measure")
         self.measure.setToolTip("Include this channel in FastLog captures")
         self.measure.toggled.connect(self.measure_changed)
-        self.output_btn = QPushButton("Output off")
-        self.output_btn.setCheckable(True)
-        self.output_btn.setToolTip("Switch this channel's output")
-        self.output_btn.clicked.connect(lambda on: self.output_requested.emit(self.ch, on))
+        self.output = ToggleSwitch()
+        self.output.setToolTip(f"Channel {ch} output: click (or press Space) to switch it on or off")
+        self.output.setAccessibleName(f"Channel {ch} output")
+        self.output.clicked.connect(self._on_output_clicked)
+        output_label = QLabel("Output")
+        output_label.setBuddy(self.output)
         row = QHBoxLayout()
         row.addWidget(self.measure)
         row.addStretch(1)
-        row.addWidget(self.output_btn)
+        row.addWidget(output_label)
+        row.addWidget(self.output)
         form.addRow(row)
 
-        self.voltage = self._spin(" V", 3, 0.0, VOLTAGE_MAX, 0.01)
+        self.voltage = SetpointSpinBox(" V", 3, 0.0, VOLTAGE_MAX, 0.01)
         self.voltage.setToolTip("Voltage setpoint; sent when you press Enter or leave the field")
-        self.voltage.editingFinished.connect(self._on_voltage)
+        self.voltage.committed.connect(lambda v: self.voltage_requested.emit(self.ch, v))
         form.addRow("Voltage", self.voltage)
-        self.current = self._spin(" A", 4, CURRENT_MIN, max_current(0), 0.001)
+        self.current = SetpointSpinBox(" A", 4, CURRENT_MIN, max_current(0), 0.001)
         self.current.setToolTip("Current limit; sent when you press Enter or leave the field.\n"
                                 "Up to 6.01 A at 6 V or less, 3.01 A above.")
-        self.current.editingFinished.connect(self._on_current)
+        self.current.committed.connect(lambda a: self.current_requested.emit(self.ch, a))
         form.addRow("Current limit", self.current)
 
         self.readout = QLabel("—")
@@ -124,37 +137,34 @@ class ChannelPanel(QGroupBox):
             self.current_range.addItem(range_label(r, "A"), r)
         tip = ("Measurement range. A fixed range gives the best accuracy and lets the app flag readings\n"
                "beyond it (they clip at about 1.13 × range). Auto switches ranges as the signal changes;\n"
-               "readings during a switch (~20 µs) can be clipped.")
+               "readings during a switch (~20 µs) can be clipped. Applied when you choose it.")
         for combo in (self.voltage_range, self.current_range):
             combo.setToolTip(tip)
-            combo.activated.connect(lambda _: self.ranges_requested.emit(self.ch))
+            combo.setPlaceholderText("—")
+            combo.activated.connect(self._on_ranges_chosen)
         row = QHBoxLayout()
         row.addWidget(self.voltage_range, 1)
         row.addWidget(self.current_range, 1)
         form.addRow("Ranges V / I", row)
-
-    @staticmethod
-    def _spin(suffix: str, decimals: int, lo: float, hi: float, step: float) -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
-        spin.setDecimals(decimals)
-        spin.setRange(lo, hi)
-        spin.setSingleStep(step)
-        spin.setSuffix(suffix)
-        spin.setKeyboardTracking(False)
-        spin.setAccelerated(True)
-        return spin
+        self.set_connected(False)
 
     # --- State ---------------------------------------------------------------------------
 
     def setup(self) -> ChannelSetup:
-        return ChannelSetup(self.ch, self.voltage_range.currentData(), self.current_range.currentData())
+        return ChannelSetup(self.ch, *self._chosen_ranges())
 
-    def select_ranges(self, voltage_range: float | None, current_range: float | None) -> None:
+    def _chosen_ranges(self) -> tuple[float | None, float | None]:
+        values = []
+        for combo, name in ((self.voltage_range, "voltage_range"), (self.current_range, "current_range")):
+            if combo.currentIndex() >= 0:
+                values.append(combo.currentData())
+            else:
+                values.append(getattr(self._status, name) if self._status is not None else None)
+        return values[0], values[1]
+
+    def _show_ranges(self, voltage_range: float | None, current_range: float | None) -> None:
         for combo, value in ((self.voltage_range, voltage_range), (self.current_range, current_range)):
-            index = next((i for i in range(combo.count())
-                          if (combo.itemData(i) is None and value is None)
-                          or (combo.itemData(i) is not None and value is not None
-                              and math.isclose(combo.itemData(i), value))), 0)
+            index = next((i for i in range(combo.count()) if _same(combo.itemData(i), value)), -1)
             combo.setCurrentIndex(index)
 
     def set_connected(self, connected: bool, has_ranges: bool = True) -> None:
@@ -162,9 +172,15 @@ class ChannelPanel(QGroupBox):
         self._has_ranges = has_ranges
         if not connected:
             self._status = None
+            self._pending.clear()
+            self.voltage.set_unknown()
+            self.current.set_unknown()
+            self.output.setChecked(False)
+            self._show_ranges(-1.0, -1.0)            # no match: shows the '—' placeholder
             self.readout.setText("—")
-            self.output_btn.setChecked(False)
-            self._style_output(False)
+            self.readout.setStyleSheet("")
+        elif not has_ranges:
+            self._show_ranges(None, None)            # without K104 the instrument autoranges
         self._update_enabled()
 
     def set_running(self, running: bool) -> None:
@@ -173,22 +189,32 @@ class ChannelPanel(QGroupBox):
 
     def _update_enabled(self) -> None:
         live = self._connected
-        for w in (self.voltage, self.current, self.output_btn):
+        for w in (self.voltage, self.current, self.output):
             w.setEnabled(live)
         self.measure.setEnabled(not self._running)
         for combo in (self.voltage_range, self.current_range):
-            combo.setEnabled(not self._running and self._has_ranges)
+            combo.setEnabled(live and not self._running and self._has_ranges)
+
+    def _expected(self, control: str, reported):
+        """What to show for a control: a change the user just made, until the instrument reports it."""
+        pending = self._pending.get(control)
+        if pending is None:
+            return reported
+        wanted, deadline = pending
+        if _same(wanted, reported) or time.monotonic() > deadline:
+            del self._pending[control]
+            return reported
+        return wanted
 
     def update_status(self, s: ChannelStatus) -> None:
         self._status = s
-        for spin, value in ((self.voltage, s.voltage_set), (self.current, s.current_set)):
-            if not spin.hasFocus():
-                spin.blockSignals(True)
-                spin.setValue(value)
-                spin.blockSignals(False)
         self.current.setMaximum(max_current(s.voltage_set))
-        self.output_btn.setChecked(s.output)
-        self._style_output(s.output)
+        self.voltage.show_value(s.voltage_set)
+        self.current.show_value(s.current_set)
+        self.output.setChecked(bool(self._expected("output", s.output)))
+        combos_open = any(c.view().isVisible() for c in (self.voltage_range, self.current_range))
+        if self._has_ranges and not combos_open:
+            self._show_ranges(*self._expected("ranges", (s.voltage_range, s.current_range)))
         if s.trips:
             text = "⚠ " + " ".join(s.trips) + " tripped"
         elif not s.output:
@@ -199,34 +225,39 @@ class ChannelPanel(QGroupBox):
         self.readout.setText(text)
         self.readout.setStyleSheet("QLabel { color: #c62828; }" if s.trips else "")
 
-    def _style_output(self, on: bool) -> None:
-        self.output_btn.setText("Output on" if on else "Output off")
-        self.output_btn.setStyleSheet(
-            "QPushButton { background: #2e7d32; color: white; font-weight: bold; }" if on else "")
+    def _on_output_clicked(self, on: bool) -> None:
+        self._pending["output"] = (on, time.monotonic() + PENDING_TIMEOUT)
+        self.output_requested.emit(self.ch, on)
 
-    def _on_voltage(self) -> None:
-        if self._connected and (self._status is None or not math.isclose(self.voltage.value(),
-                                                                           self._status.voltage_set)):
-            self.voltage_requested.emit(self.ch, self.voltage.value())
+    def _on_ranges_chosen(self, *_) -> None:
+        ranges = (self.voltage_range.currentData(), self.current_range.currentData())
+        self._pending["ranges"] = (ranges, time.monotonic() + PENDING_TIMEOUT)
+        self.ranges_requested.emit(self.ch, *ranges)
 
-    def _on_current(self) -> None:
-        if self._connected and (self._status is None or not math.isclose(self.current.value(),
-                                                                           self._status.current_set)):
-            self.current_requested.emit(self.ch, self.current.value())
+
+def _same(a, b) -> bool:
+    """Equal, treating floats as equal when close and None (autorange) as a value."""
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return math.isclose(a, b)
+    return a == b
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, resource: str | None = None, protocol: str | None = None):
+    def __init__(self, resource: str | None = None, protocol: str | None = None,
+                 settings: QSettings | None = None):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
-        self.settings = QSettings("EmbedWise", "NGMDAQ")
+        # Only app preferences are remembered. Channel settings (setpoints, outputs, ranges) always
+        # come from the instrument, so connecting never changes it.
+        self.settings = settings or QSettings("EmbedWise", "NGMDAQ")
         self.info: DeviceInfo | None = None
         self.capture: Capture | None = None       # capture on display
         self.last_complete: Capture | None = None
         self._busy = False                        # scanning, connecting, restarting
         self._connecting = False                  # connecting, or restarting and reconnecting
         self._restarting = False
-        self._ranges_synced: set[int] = set()
         self._running = False
         self._stopping = False
         self._armed = False
@@ -506,7 +537,7 @@ class MainWindow(QMainWindow):
         self.missing_bands: dict[str, Bands] = {}
         self.clipped_bands: dict[str, Bands] = {}
         for q in QUANTITIES:
-            p = pg.PlotItem()
+            p = pg.PlotItem(axisItems={"left": ValueAxis()})
             p.showGrid(x=True, y=True, alpha=0.3)
             p.setLabel("left", QUANTITY_LABELS[q], units=UNITS[q])
             p.getViewBox().setAutoVisible(y=True)
@@ -568,9 +599,6 @@ class MainWindow(QMainWindow):
         self.protocol.setCurrentText(protocol or s.value("protocol", PROTOCOLS[0], str))
         for ch, panel in self.channel_panels.items():
             panel.measure.setChecked(s.value(f"ch{ch}/measure", ch == 1, bool))
-            v = s.value(f"ch{ch}/voltage_range", "auto", str)
-            i = s.value(f"ch{ch}/current_range", "auto", str)
-            panel.select_ranges(None if v == "auto" else float(v), None if i == "auto" else float(i))
         rate = s.value("rate", SampleRate.R50K.name, str)
         self.rate.setCurrentIndex(self.rate.findData(SampleRate.__members__.get(rate, SampleRate.R50K)))
         mode = TriggerMode.__members__.get(s.value("trigger_mode", "SINGLE", str), TriggerMode.SINGLE)
@@ -598,10 +626,9 @@ class MainWindow(QMainWindow):
         s = self.settings
         s.setValue("protocol", self.protocol.currentText())
         for ch, panel in self.channel_panels.items():
-            setup = panel.setup()
             s.setValue(f"ch{ch}/measure", panel.measure.isChecked())
-            s.setValue(f"ch{ch}/voltage_range", "auto" if setup.voltage_range is None else setup.voltage_range)
-            s.setValue(f"ch{ch}/current_range", "auto" if setup.current_range is None else setup.current_range)
+            for key in ("voltage_range", "current_range"):     # remembered by versions before 0.2.0
+                s.remove(f"ch{ch}/{key}")
         s.setValue("rate", self.rate.currentData().name)
         s.setValue("duration_s", self.duration.value())
         s.setValue("trigger_mode", self.trigger_mode.currentData().name)
@@ -751,7 +778,6 @@ class MainWindow(QMainWindow):
         self.device_label.setToolTip(
             f"{info.manufacturer} {info.model} ({info.part_number})\nSerial {info.serial}\n"
             f"Firmware {info.firmware}\nOptions {', '.join(sorted(info.options)) or 'none'}\n{info.resource}")
-        self._ranges_synced = set()
         for ch, panel in self.channel_panels.items():
             panel.set_connected(ch in info.channels, info.has_ranges)
         msg = f"Connected to {info.model} at {info.resource}"
@@ -779,20 +805,14 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_status(self, statuses: dict) -> None:
         for ch, status in statuses.items():
-            panel = self.channel_panels[ch]
-            panel.update_status(status)
-            if ch not in self._ranges_synced and self.info is not None and self.info.has_ranges:
-                # Show the instrument's ranges once after connecting; after that the panel drives them.
-                self._ranges_synced.add(ch)
-                panel.select_ranges(status.voltage_range, status.current_range)
+            self.channel_panels[ch].update_status(status)
 
     def _on_output_requested(self, ch: int, on: bool) -> None:
         self.worker.set_output(ch, on)
 
-    def _on_ranges_requested(self, ch: int) -> None:
+    def _on_ranges_requested(self, ch: int, voltage_range: float | None, current_range: float | None) -> None:
         if self.info is not None and not self._running:
-            setup = self.channel_panels[ch].setup()
-            self.worker.set_ranges(ch, setup.voltage_range, setup.current_range)
+            self.worker.set_ranges(ch, voltage_range, current_range)
 
     def _on_measure_changed(self) -> None:
         self._update_summary()

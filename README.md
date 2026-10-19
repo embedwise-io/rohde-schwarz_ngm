@@ -38,19 +38,24 @@ installation is needed. HiSLIP and VXI-11 go through pyvisa-py.
 ```
 
 1. Enter the NGM's IP address (or a full VISA resource string), or press **Scan**. Keep the
-   protocol on Socket unless you have a reason not to, then press **Connect**. The channel
-   panels fill in from the instrument; setpoints are never pushed from saved settings.
+   protocol on Socket unless you have a reason not to, then press **Connect**. Connecting
+   only reads: the channel panels show the instrument's setpoints, output states and ranges,
+   and nothing is sent until you change a control. Until then they show "—".
 2. In each **Channel** panel:
-   - **Voltage** and **Current limit** are sent when you press Enter or leave the field.
-   - **Output on/off** switches that channel's output.
+   - **Voltage** and **Current limit** are sent when you press Enter or leave the field,
+     and only if you changed them. The mouse wheel only adjusts a field you have clicked into.
+   - The **Output** switch shows whether the output is OFF or ON; click it (or press Space)
+     to switch the output.
    - The readout shows the measured voltage, current and power, and CV/CC. A tripped
      OCP/OVP/OPP/OTP shows in red.
    - **Ranges V / I** set the measurement ranges: 5 V or 20 V; 10 mA, 100 mA, 1 A or 10 A;
-     or Auto. Use a fixed range when you can (see Clipped readings below).
+     or Auto, applied when you choose them. Use a fixed range when you can (see Clipped
+     readings below).
    - **Measure** includes the channel in captures.
 
    Setpoints and outputs stay live during a capture, so you can step the voltage or switch
-   an output while logging.
+   an output while logging. The panels also follow changes made on the instrument's front
+   panel, within a second.
 3. In **Acquisition**, choose the sample rate (100 Sa/s to 500 kSa/s per channel; both
    channels together are limited to 500 kSa/s, so 250 kSa/s each), the acquisition time and
    the trigger mode:
@@ -86,7 +91,9 @@ If FastLog stops with an internal error (see below), the error dialog offers **R
 Instrument**; the **Restart…** button does the same at any time. The instrument reboots in
 about 40 s and the app reconnects.
 
-Settings and recent addresses are remembered between sessions.
+App preferences (acquisition settings, plot options, which channels to measure) and recent
+addresses are remembered between sessions. Channel settings are not: they always come from
+the instrument.
 
 ## Saved files
 
@@ -214,17 +221,16 @@ Bluetooth-device-like load on CH1:
 .venv/bin/ngm-daq --resource TCPIP::127.0.0.1::5025::SOCKET
 ```
 
-`uv sync --extra test && .venv/bin/pytest` runs the unit tests and the worker against the
-simulator, in about 25 s.
+`uv sync --extra test && .venv/bin/pytest` runs the unit tests, and the worker and main
+window against the simulator, in about 35 s. (A plain `uv sync` removes pytest again.)
 
 ## Notes
 
 - **Measurement ranges** need the K104 option. Without it the app leaves the ranges on Auto.
 - **FastLog to USB.** If FastLog was set to write to a USB stick on the front panel, the app
   switches that channel's target to SCPI when it runs.
-- **Front panel.** The front panel stays usable while the app is connected. Setpoint and
-  output changes made there show up in the channel panels within a second; measurement
-  ranges are read once, when the app connects.
+- **Front panel.** The front panel stays usable while the app is connected; changes made
+  there show up in the channel panels within a second.
 - **Restart.** Restarting the instrument switches its outputs off.
 
 ## Future development

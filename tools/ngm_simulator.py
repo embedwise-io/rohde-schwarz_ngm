@@ -42,9 +42,8 @@ class Channel:
     def __init__(self, number: int, load: bool):
         self.number = number
         self.load = load
-        self.voltage = 1.0
-        self.current = 0.1
         self.voltage_history = [(-math.inf, 1.0)]    # (time set, value): samples use the value at their time
+        self.current = 0.1
         self.output = False
         self.t_on = -math.inf
         self.t_off = -math.inf
@@ -58,6 +57,14 @@ class Channel:
         self.delivered = -1         # index of the last chunk read
         self.signalled = -1         # index of the last chunk reported in the event register
         self.oper_event = 0
+
+    @property
+    def voltage(self) -> float:
+        return self.voltage_history[-1][1]
+
+    @voltage.setter
+    def voltage(self, value: float) -> None:
+        self.voltage_history.append((time.monotonic(), value))
 
     # --- Signal model --------------------------------------------------------------------
 
@@ -110,6 +117,7 @@ class SimulatedNGM:
         self.model = model
         self.lock = threading.Lock()
         self.rng = np.random.default_rng()
+        self.command_log: list[str] = []      # every command that isn't a query, for tests
         self.reset()
 
     def reset(self) -> None:
@@ -137,6 +145,8 @@ class SimulatedNGM:
                 part = part.strip()
                 if not part:
                     continue
+                if "?" not in part:
+                    self.command_log.append(part.lstrip(":"))
                 reply = self._dispatch(part.lstrip(":"))
                 if reply is not None:
                     replies.append(reply if isinstance(reply, bytes) else reply.encode())
@@ -214,8 +224,6 @@ class SimulatedNGM:
                 self.error(-222, "Data out of range")
             else:
                 setattr(ch, name, value)
-                if name == "voltage":
-                    ch.voltage_history.append((now, value))
             return None
         if h in ("OUTP", "OUTP:STAT", "OUTP?", "OUTP:STAT?"):
             if h.endswith("?"):

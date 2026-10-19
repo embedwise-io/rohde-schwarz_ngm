@@ -13,7 +13,7 @@ import math
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QPointF, QRectF
-from PyQt6.QtGui import QPainter, QPolygonF
+from PyQt6.QtGui import QFont, QFontMetricsF, QPainter, QPolygonF
 
 from .capture import ChannelData, binned_raw
 
@@ -23,6 +23,33 @@ MARKER_SIZE = 5
 BAND_MIN_WIDTH_PX = 3             # a single flagged sample stays visible when zoomed out
 BOUNDS_RAW_LIMIT = 1_000_000      # y auto-range uses raw samples up to this many, else the pyramid
 STYLES = ("Line", "Line + points", "Points")
+TICK_DIGITS = 8                   # significant digits in y tick labels: one more than float32 resolves
+
+
+class ValueAxis(pg.AxisItem):
+    """Y axis with a constant width, so stacked plots keep identical plot areas.
+
+    pyqtgraph sizes an axis to its widest tick label, so zooming (more or fewer decimals) would
+    move the plot area sideways, and plots with different labels would no longer line up with the
+    shared time axis. This one keeps room for TICK_DIGITS digits, a sign and a point, and never
+    labels with more.
+    """
+
+    def __init__(self, orientation: str = "left", **kwargs):
+        super().__init__(orientation, **kwargs)
+        font = self.style["tickFont"] or QFont()
+        widest = QFontMetricsF(font).horizontalAdvance("-." + "8" * TICK_DIGITS)
+        self.setStyle(autoExpandTextSpace=False, tickTextWidth=math.ceil(widest) + 2)
+
+    def tickStrings(self, values, scale, spacing):
+        if self.logMode:
+            return super().tickStrings(values, scale, spacing)
+        scaled = [v * scale for v in values]
+        step = spacing * scale
+        whole = len(str(int(max(map(abs, scaled), default=0.0))))      # digits before the point
+        places = max(0, min(math.ceil(-math.log10(step)), TICK_DIGITS - whole))
+        # Rounding can leave a zero tick at -1e-17, which would print as -0.00.
+        return [f"{0.0 if abs(v) < step * 1e-3 else v:.{places}f}" for v in scaled]
 
 
 class EnvelopeCurve(pg.GraphicsObject):
