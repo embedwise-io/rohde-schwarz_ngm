@@ -2,6 +2,11 @@
 
 Notable changes to R&S NGM FastLog. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] — 2026-11-01
+
+First stable release. The app is the same as 0.2.0, which passed preliminary testing on an
+NGM202 with a Bluetooth device on CH1. The known limitations listed under 0.1.0 still apply.
+
 ## [0.2.0] — 2026-10-19
 
 ### Changed
