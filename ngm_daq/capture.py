@@ -482,3 +482,47 @@ def window_stats(ch: ChannelData, start: int, stop: int, interval: float) -> Sta
         missing=ch.missing.count_in(start, stop),
         voltage_clipped=ch.voltage_clipped.count_in(start, stop),
         current_clipped=ch.current_clipped.count_in(start, stop))
+
+
+def samples_between(t0: float, t1: float, interval: float, n: int) -> tuple[int, int]:
+    """Sample range [start, stop) whose times (index × interval) lie in [t0, t1], within [0, n)."""
+    start = min(n, max(0, math.ceil(t0 / interval - 1e-6)))
+    stop = min(n, math.floor(t1 / interval + 1e-6) + 1)
+    return start, max(start, stop)
+
+
+@dataclass(frozen=True)
+class BoxStats:
+    """One quantity's samples inside a selection box: in its time span and between its levels."""
+    span: int                        # valid (not missing) samples in the time span
+    count: int                       # of those, the ones between the levels
+    mean: float
+    std: float
+    min: float
+    max: float
+
+
+def box_stats(ch: ChannelData, quantity: str, start: int, stop: int, lo: float, hi: float) -> BoxStats:
+    """Statistics of samples [start, stop) of a quantity with values in [lo, hi], ignoring missing ones."""
+    stop = min(stop, ch.n)
+    span = count = 0
+    total = squares = 0.0
+    low, high = math.inf, -math.inf
+    for a in range(start, stop, STATS_BLOCK):
+        b = min(stop, a + STATS_BLOCK)
+        if quantity == "power":
+            x = ch.voltage[a:b].astype(np.float64) * ch.current[a:b]
+        else:
+            x = getattr(ch, quantity)[a:b].astype(np.float64)
+        span += int(np.isfinite(x).sum())
+        x = x[(x >= lo) & (x <= hi)]                 # NaN compares false: missing samples drop out
+        if len(x) == 0:
+            continue
+        count += len(x)
+        total += float(x.sum())
+        squares += float(np.dot(x, x))
+        low, high = min(low, float(x.min())), max(high, float(x.max()))
+    if count == 0:
+        return BoxStats(span, 0, math.nan, math.nan, math.nan, math.nan)
+    mean = total / count
+    return BoxStats(span, count, mean, math.sqrt(max(0.0, squares / count - mean ** 2)), low, high)

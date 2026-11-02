@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 
 from ngm_daq.capture import (
-    PYRAMID_BASE, ChannelData, ChannelSettings, GapTracker, IntervalList, MinMaxPyramid, binned_raw,
-    clipped_mask, merge_intervals, window_stats,
+    PYRAMID_BASE, ChannelData, ChannelSettings, GapTracker, IntervalList, MinMaxPyramid, binned_raw, box_stats,
+    clipped_mask, merge_intervals, samples_between, window_stats,
 )
 from ngm_daq.instrument import CHUNK_PERIOD, CURRENT_RANGES
 
@@ -145,3 +145,25 @@ def test_window_stats_skips_missing():
     assert s.valid == 200 and s.samples == 300
     assert s.mean["voltage"] == pytest.approx(2.0)
     assert s.missing == (100, 1)
+
+
+def test_samples_between():
+    assert samples_between(0.0105, 0.0200, 1e-3, 1000) == (11, 21)      # samples at 11 ms ... 20 ms
+    assert samples_between(-1.0, 0.5, 1e-3, 100) == (0, 100)
+    assert samples_between(0.2, 0.3, 1e-3, 100) == (100, 100)          # beyond the data: empty
+
+
+def test_box_stats_counts_samples_between_the_levels():
+    ch = ChannelData(settings(), capacity=400)
+    v = np.full(400, 4.0, np.float32)
+    i = np.tile(np.array([0.001, 0.010, 0.020, 0.050], np.float32), 100)
+    ch.append(np.column_stack((v[:300], i[:300])))
+    ch.append_missing(100)
+    s = box_stats(ch, "current", 0, 400, 0.005, 0.030)
+    assert s.span == 300 and s.count == 150
+    assert s.min == pytest.approx(0.010) and s.max == pytest.approx(0.020)
+    assert s.mean == pytest.approx(0.015) and s.std == pytest.approx(0.005, rel=1e-5)
+    p = box_stats(ch, "power", 4, 8, 0.0, 0.1)                          # 4, 40, 80 mW; 200 mW is above
+    assert p.count == 3 and p.max == pytest.approx(0.080)
+    empty = box_stats(ch, "voltage", 0, 400, 5.0, 6.0)
+    assert empty.count == 0 and math.isnan(empty.mean)

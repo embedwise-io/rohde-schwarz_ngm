@@ -2,6 +2,40 @@
 
 Notable changes to R&S NGM FastLog. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-11-01
+
+### Added
+
+- **Markers.** X1 and X2 mark times across all plots; Y1 and Y2 mark levels in one plot
+  (voltage, current or power). Each is a labelled line you drag to move, in magenta for X and
+  green for Y. Place them with the **Markers** button, or at a point from a plot's right-click
+  menu. The Measurements panel shows the time at X1 and X2 with each channel's V, I and P
+  there, ΔX = X2 − X1 and 1/ΔX; and the levels at Y1 and Y2, ΔY = Y2 − Y1 and 1/ΔY.
+  **Clear** removes them.
+- **Selection box.** With **Select** on, dragging in a plot draws a translucent box instead
+  of panning. The Measurements panel shows, for each channel, the points in the box's time
+  range, the points in the box (also between its levels), the time in the box (with its share
+  of the time range, e.g. the time above a threshold), and the min, mean, max and σ of the
+  points in the box. Drag a corner to resize the box, or with Select on the inside to move it;
+  **Esc** clears it.
+- **Measurements panel.** Shown beside the plots while there are markers or a selection.
+  **Pop Out** moves it into a window of its own (closing it clears the markers and the
+  selection), and **Dock** puts it back. Docked or popped out is remembered.
+
+### Fixed
+
+- **Plots resizing as the mouse moved.** The cursor readout under the plots changed width
+  with the values under the mouse, which changed where the statistics beside it wrapped. The
+  plots then grew and shrank as the statistics took more or fewer lines. Most noticeable with
+  the Measurements panel open. The readout now keeps the width of its longest text, and the
+  statistics keep the height their longest text needs at the current window width, so the
+  plots resize only with the window.
+
+### Also
+
+- Tests drive the markers and the selection box with the mouse, and check that the plots
+  keep their size as the readouts change (66 tests in total).
+
 ## [1.0.0] — 2026-11-01
 
 First stable release. The app is the same as 0.2.0, which passed preliminary testing on an

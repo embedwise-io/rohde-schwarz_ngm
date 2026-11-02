@@ -76,7 +76,32 @@ installation is needed. HiSLIP and VXI-11 go through pyvisa-py.
    and max of V, I and P, energy (J and Wh) and charge (C and Ah). The cursor readout shows
    the sample under the mouse. **Style** selects Line, Line + points (markers once samples
    are 3 px apart) or Points.
-6. **Highlight** shades two kinds of problem samples. Bands are at least 3 px wide so a
+6. **Markers** places X1 and X2 (magenta: times, across all plots) and Y1 and Y2 (green:
+   levels, in one plot), and opens the **Measurements** panel. Drag a marker to move it, or
+   right-click a plot and choose **Place X1 Here** (and so on) to put one at that point. The
+   panel shows:
+   - for X1 and X2: the time, each channel's V, I and P at that sample, ΔX = X2 − X1 with the
+     differences, and 1/ΔX in Hz;
+   - for Y1 and Y2: the level, ΔY = Y2 − Y1 and 1/ΔY. **Y1, Y2 in** chooses their plot.
+
+   **Clear** in the panel, or clicking **Markers** again, removes them.
+7. **Select** works like **Box Zoom**: while it is on, dragging in a plot draws a selection
+   box instead of panning. The box is translucent, so the samples stay visible. The panel
+   shows its time range and levels and, for each channel:
+   - **Points in time range:** samples between the box's left and right edges;
+   - **Points in box:** of those, the ones also between its bottom and top edges;
+   - **Time in box:** points in box × the sample interval, with its share of the time range.
+     With the bottom edge at a threshold, that is the time above it (or a duty cycle);
+   - min, mean, max and σ of the points in box.
+
+   Missing samples are left out. Drag a corner to resize the box; with **Select** on, drag
+   the inside to move it. A new box replaces the old one. **Esc** or **Clear** removes it.
+
+   The Measurements panel shows beside the plots while there are markers or a selection.
+   **Pop Out** moves it into a window of its own that you can put anywhere, and gives the
+   plots their full width back; **Dock** puts it back. Closing that window clears the
+   markers and the selection. Docked or popped out is remembered.
+8. **Highlight** shades two kinds of problem samples. Bands are at least 3 px wide so a
    single sample stays visible, and **◀ ▶** jump between them:
    - **Gaps (red):** samples that never reached the PC (see Lost data below). They are
      stored as NaN.
@@ -84,7 +109,7 @@ installation is needed. HiSLIP and VXI-11 go through pyvisa-py.
      range limit, so the true value is unknown.
 
    A warning bar summarises both, with a hint (for example "choose a range above 100 mA").
-7. **Save View…** writes the displayed samples; **Save All…** writes the whole capture.
+9. **Save View…** writes the displayed samples; **Save All…** writes the whole capture.
    **Format** chooses CSV or HDF5 (see below).
 
 If FastLog stops with an internal error (see below), the error dialog offers **Restart
@@ -222,7 +247,7 @@ Bluetooth-device-like load on CH1:
 ```
 
 `uv sync --extra test && .venv/bin/pytest` runs the unit tests, and the worker and main
-window against the simulator, in about 35 s. (A plain `uv sync` removes pytest again.)
+window against the simulator, in about 45 s. (A plain `uv sync` removes pytest again.)
 
 ## Notes
 

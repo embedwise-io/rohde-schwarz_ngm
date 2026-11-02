@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QRectF, QSize, Qt, QVariantAnimation, pyqtSignal as Signal
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
-from PyQt6.QtWidgets import QAbstractButton, QDoubleSpinBox, QSizePolicy
+from PyQt6.QtWidgets import QAbstractButton, QDoubleSpinBox, QSizePolicy, QVBoxLayout, QWidget
 
 SWITCH_ON = QColor("#2e7d32")
 SWITCH_OFF = QColor("#757575")
@@ -153,3 +153,22 @@ class SetpointSpinBox(QDoubleSpinBox):
             super().wheelEvent(event)
         else:
             event.ignore()
+
+
+class PopOutWindow(QWidget):
+    """A separate window, kept above its parent, that emits `closed` when the user closes it.
+
+    Unlike a floating QDockWidget, it has a title bar drawn by the platform, so it can be moved
+    on Wayland too (Qt moves floating docks itself, which Wayland doesn't allow).
+    """
+
+    closed = Signal()
+
+    def __init__(self, title: str, parent: QWidget):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(title)
+        QVBoxLayout(self).setContentsMargins(0, 0, 0, 0)
+
+    def closeEvent(self, event) -> None:
+        super().closeEvent(event)
+        self.closed.emit()

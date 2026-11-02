@@ -4,6 +4,9 @@ A 500 kSa/s capture holds 30 million samples per minute, too many to hand to Plo
 (which also needs a float64 time array of the same length). EnvelopeCurve draws straight from a
 ChannelData buffer: zoomed out, one min/max pair per pixel column from the capture's pyramids;
 zoomed in, the raw samples. Either way a repaint touches a few thousand points.
+
+Also here: the X/Y marker lines and the selection box drawn over the plots, and the colours and
+number formatting shared by the plots and their readouts.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import math
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QPointF, QRectF
+from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal as Signal
 from PyQt6.QtGui import QFont, QFontMetricsF, QPainter, QPolygonF
 
 from .capture import ChannelData, binned_raw
@@ -24,6 +27,23 @@ BAND_MIN_WIDTH_PX = 3             # a single flagged sample stays visible when z
 BOUNDS_RAW_LIMIT = 1_000_000      # y auto-range uses raw samples up to this many, else the pyramid
 STYLES = ("Line", "Line + points", "Points")
 TICK_DIGITS = 8                   # significant digits in y tick labels: one more than float32 resolves
+
+CHANNEL_COLORS = {1: "#ff9f1a", 2: "#3fa9f5"}     # the instrument's Ch1 orange and Ch2 blue
+QUANTITY_LABELS = {"voltage": "Voltage", "current": "Current", "power": "Power"}
+X_MARKER_COLOR = "#f06bff"                         # magenta: X1, X2 (time)
+Y_MARKER_COLOR = "#5df07d"                         # green: Y1, Y2 (level)
+SELECTION_FILL = (255, 255, 255, 28)               # light enough to see the samples underneath
+SELECTION_HANDLE_SIZE = 8                          # px
+
+
+def si(value: float, unit: str, precision: int = 5) -> str:
+    if value is None or not math.isfinite(value):
+        return "—"
+    return pg.siFormat(value, precision=precision, suffix=unit)
+
+
+def colored(text: str, ch: int) -> str:
+    return f"<span style='color:{CHANNEL_COLORS[ch]}; font-weight:bold'>{text}</span>"
 
 
 class ValueAxis(pg.AxisItem):
@@ -243,3 +263,76 @@ class Bands(pg.GraphicsObject):
         painter.setBrush(self._brush)
         for a, b in zip(starts, stops):
             painter.drawRect(QRectF(a, view.top(), b - a, view.height()))
+
+
+class PlotViewBox(pg.ViewBox):
+    """ViewBox that can draw a selection box instead of panning, and remembers where its menu opened.
+
+    While `selecting` is set, a left-drag emits sigSelecting(start, end, finished) in data
+    coordinates instead of panning. Other buttons, the wheel and axis drags work as usual.
+    """
+
+    sigSelecting = Signal(object, object, bool)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.selecting = False
+        self.menu_point: QPointF | None = None      # where the context menu was opened (data coordinates)
+        self._origin = QPointF()
+
+    def mouseDragEvent(self, ev, axis=None):
+        if self.selecting and axis is None and ev.button() == Qt.MouseButton.LeftButton:
+            ev.accept()
+            if ev.isStart():        # in data coordinates, in case the layout changes during the drag
+                self._origin = self.mapSceneToView(ev.buttonDownScenePos())
+            self.sigSelecting.emit(self._origin, self.mapSceneToView(ev.scenePos()), ev.isFinish())
+            return
+        super().mouseDragEvent(ev, axis)
+
+    def raiseContextMenu(self, ev):
+        self.menu_point = self.mapSceneToView(ev.scenePos())
+        super().raiseContextMenu(ev)
+
+
+class MarkerLine(pg.InfiniteLine):
+    """A draggable marker: a vertical (time) or horizontal (level) line labelled with its name."""
+
+    def __init__(self, name: str, vertical: bool, color: str, dashed: bool, label_position: float):
+        style = Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine
+        super().__init__(angle=90 if vertical else 0, movable=True, pen=pg.mkPen(color, width=1, style=style),
+                         hoverPen=pg.mkPen(color, width=3), label=name,
+                         labelOpts={"position": label_position, "color": color, "fill": (0, 0, 0, 220)})
+        self.name = name
+        self.setCursor(Qt.CursorShape.SizeHorCursor if vertical else Qt.CursorShape.SizeVerCursor)
+        self.setZValue(20)
+
+
+class SelectionBox(pg.ROI):
+    """Translucent selection rectangle with a handle on each corner to resize it.
+
+    Dragging the inside moves it only while `translatable` is set (Select mode); otherwise a drag
+    there pans the plot as usual.
+    """
+
+    def __init__(self):
+        super().__init__((0, 0), (1, 1), movable=False, rotatable=False, resizable=False,
+                         pen=pg.mkPen("w", width=1), hoverPen=pg.mkPen("y", width=1),
+                         handlePen=pg.mkPen("w", width=1), handleHoverPen=pg.mkPen("y", width=2))
+        self.handleSize = SELECTION_HANDLE_SIZE
+        for x, y in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            self.addScaleHandle((x, y), (1 - x, 1 - y))        # the opposite corner stays put
+        self._brush = pg.mkBrush(SELECTION_FILL)
+        self.setZValue(15)
+
+    def set_corners(self, x0: float, y0: float, x1: float, y1: float, finish: bool = True) -> None:
+        self.setPos((min(x0, x1), min(y0, y1)), update=False)
+        self.setSize((abs(x1 - x0), abs(y1 - y0)), finish=finish)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        """(x0, x1, y0, y1), lowest first."""
+        (x, y), (w, h) = self.pos(), self.size()
+        return min(x, x + w), max(x, x + w), min(y, y + h), max(y, y + h)
+
+    def paint(self, p, opt, widget):
+        p.fillRect(QRectF(0, 0, self.state["size"][0], self.state["size"][1]).normalized(), self._brush)
+        super().paint(p, opt, widget)
