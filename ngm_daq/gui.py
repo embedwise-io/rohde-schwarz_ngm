@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 from . import __version__, export
 from .capture import (
     PYRAMID_BASE, PYRAMID_FACTOR, QUANTITIES, UNITS, Capture, RunConfig, Stats, TriggerMode, merge_intervals,
-    samples_between, window_stats,
+    window_stats,
 )
 from .instrument import (
     CHUNK_PERIOD, CURRENT_MIN, CURRENT_RANGES, MAX_TOTAL_RATE, PROTOCOLS, VOLTAGE_MAX, VOLTAGE_RANGES,
@@ -32,10 +32,11 @@ from .instrument import (
 )
 from .measurements import MeasurementsPanel
 from .plotting import (
-    CHANNEL_COLORS, QUANTITY_LABELS, STYLES, Bands, EnvelopeCurve, PlotViewBox, ValueAxis, colored, si,
+    CHANNEL_COLORS, QUANTITY_LABELS, ROLL_DIVISIONS, STYLES, Bands, EnvelopeCurve, PlotViewBox, TimeAxis, ValueAxis,
+    colored, format_time, si,
 )
 from .widgets import PopOutWindow, SetpointSpinBox, ToggleSwitch
-from .worker import InstrumentWorker
+from .worker import ROLL_SLACK, InstrumentWorker, roll_capacity
 
 APP_NAME = "R&S NGM FastLog"
 HISTORY_LENGTH = 10
@@ -46,6 +47,14 @@ MEMORY_FRACTION = 0.5                              # of available RAM that captu
 BYTES_PER_SAMPLE = 8 + 3 * 2 * 4 / PYRAMID_BASE * PYRAMID_FACTOR / (PYRAMID_FACTOR - 1)   # V, I + pyramids
 DEFAULT_DURATION = 2.0
 PENDING_TIMEOUT = 2.0                              # s a control shows a request before the instrument confirms it
+# Roll mode: time per division (s), in the oscilloscope's 1-2-5 steps. The span is ROLL_DIVISIONS of them.
+TIMEBASES = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1800, 3600)
+DEFAULT_TIMEBASE = 1.0
+ROLL_FRAME_INTERVAL = 33                           # ms between scroll steps
+# Data arrives in chunks of CHUNK_PERIOD. The display runs this far behind the newest sample, so it
+# can reveal each chunk at a steady pace instead of jumping a chunk at a time.
+ROLL_LATENCY = CHUNK_PERIOD + 0.05
+ROLL_STATS_PERIOD = 1.0                            # s between statistics updates while rolling (or 10 × their cost)
 
 
 def rich_text_size(html: str, font, width: float = -1) -> tuple[float, float]:
@@ -65,6 +74,17 @@ def worst_stats() -> Stats:
     return Stats(samples=0, valid=1, mean=value, std=dict.fromkeys(QUANTITIES, 888e-3), min=value, max=value,
                  energy_j=-888.8, charge_c=-888.8, missing=(88_888_888, 88_888),
                  voltage_clipped=(88_888_888, 88_888), current_clipped=(0, 0))
+
+
+def format_span(seconds: float) -> str:
+    """A round time such as a time base: 100 ms, 2 s, 5 min, 1 h."""
+    if seconds < 1:
+        return f"{seconds * 1e3:g} ms"
+    if seconds < 60:
+        return f"{seconds:g} s"
+    if seconds < 3600:
+        return f"{seconds / 60:g} min"
+    return f"{seconds / 3600:g} h"
 
 
 def format_duration(seconds: float) -> str:
@@ -415,13 +435,26 @@ class MainWindow(QMainWindow):
         self.duration.setAccelerated(True)
         self.duration.valueChanged.connect(self._update_summary)
         form.addRow("Acquisition time", self.duration)
+        self.timebase = QComboBox()
+        for div in TIMEBASES:
+            self.timebase.addItem(f"{format_span(div)}/div", div)
+        self.timebase.setCurrentIndex(self.timebase.findData(DEFAULT_TIMEBASE))
+        self.timebase.setToolTip(
+            f"Roll mode: time per division. The plots show {ROLL_DIVISIONS} divisions, and only that span\n"
+            "is kept in memory: older samples are discarded as new ones arrive.")
+        self.timebase.currentIndexChanged.connect(self._update_summary)
+        self.span_label = QLabel()
+        self.timebase_row = self._group(self.timebase, self.span_label)
+        form.addRow("Time base", self.timebase_row)
+        self._acquisition_form = form
         self.trigger_mode = QComboBox()
         for mode in TriggerMode:
             self.trigger_mode.addItem(mode.value, mode)
         self.trigger_mode.setToolTip(
             "Single: Run takes one capture. Stop early to keep what was recorded.\n"
             "Auto: captures follow each other seamlessly until Stop; the last complete one is kept.\n"
-            "Manual: Run arms FastLog; each Trigger press takes one capture, then it re-arms until Stop.")
+            "Manual: Run arms FastLog; each Trigger press takes one capture, then it re-arms until Stop.\n"
+            "Roll: acquires until Stop and scrolls like a strip chart, keeping only the span on display.")
         self.trigger_mode.currentIndexChanged.connect(self._update_controls)
         self.trigger_mode.currentIndexChanged.connect(self._update_summary)
         form.addRow("Trigger mode", self.trigger_mode)
@@ -592,7 +625,7 @@ class MainWindow(QMainWindow):
         self.missing_bands: dict[str, Bands] = {}
         self.clipped_bands: dict[str, Bands] = {}
         for q in QUANTITIES:
-            p = pg.PlotItem(viewBox=PlotViewBox(), axisItems={"left": ValueAxis()})
+            p = pg.PlotItem(viewBox=PlotViewBox(), axisItems={"left": ValueAxis(), "bottom": TimeAxis()})
             p.showGrid(x=True, y=True, alpha=0.3)
             p.setLabel("left", QUANTITY_LABELS[q], units=UNITS[q])
             p.getViewBox().setAutoVisible(y=True)
@@ -630,7 +663,7 @@ class MainWindow(QMainWindow):
         # The two labels share the row, and the statistics wrap. Neither may change size with the
         # values shown, or the plots above would resize as the mouse moves: the cursor readout keeps
         # the width of its longest text, and the statistics the height of theirs (_reserve_stats_height).
-        widest = self._cursor_text(888_888_888, 888.8888e-3,
+        widest = self._cursor_text(88_888_888_888, 88888.8888,
                                    [(ch, -888.888e-3, -888.88e-3, -888.8e-3) for ch in CHANNEL_COLORS])
         self.cursor_label.setMinimumWidth(math.ceil(rich_text_size(widest, self.cursor_label.font())[0]) + 2)
         self.stats_label.installEventFilter(self)
@@ -640,6 +673,12 @@ class MainWindow(QMainWindow):
 
         self._stats_timer = QTimer(self, singleShot=True, interval=150)
         self._stats_timer.timeout.connect(self._update_stats)
+        self._roll_timer = QTimer(self, interval=ROLL_FRAME_INTERVAL)
+        self._roll_timer.timeout.connect(self._roll_frame)
+        self._roll_end = 0.0                        # time of the newest sample received (s)
+        self._roll_arrival = 0.0                    # when it arrived (monotonic)
+        self._roll_shown: float | None = None       # time at the right edge of the plots
+        self._roll_stats_due = 0.0
         self._arrange_plots()
         return panel
 
@@ -685,6 +724,8 @@ class MainWindow(QMainWindow):
             self.export_format.buttons()[0].setChecked(True)
         self._update_summary()                     # sets the duration limit before the value
         self.duration.setValue(s.value("duration_s", DEFAULT_DURATION, float))
+        self.timebase.setCurrentIndex(max(0, self.timebase.findData(s.value("timebase_s", DEFAULT_TIMEBASE, float))))
+        self._update_summary()
         if geometry := s.value("geometry"):
             self.restoreGeometry(geometry)
         if splitter := s.value("splitter"):
@@ -705,6 +746,7 @@ class MainWindow(QMainWindow):
                 s.remove(f"ch{ch}/{key}")
         s.setValue("rate", self.rate.currentData().name)
         s.setValue("duration_s", self.duration.value())
+        s.setValue("timebase_s", self.timebase.currentData())
         s.setValue("trigger_mode", self.trigger_mode.currentData().name)
         s.setValue("output_on_start", self.output_on_start.isChecked())
         s.setValue("output_off_end", self.output_off_end.isChecked())
@@ -735,7 +777,8 @@ class MainWindow(QMainWindow):
         return RunConfig(
             channels=tuple(self.channel_panels[ch].setup() for ch in self.measured_channels()),
             rate=self.rate.currentData(),
-            duration=self.duration.value(),
+            duration=self._roll_span() if self.trigger_mode.currentData() is TriggerMode.ROLL
+            else self.duration.value(),
             mode=self.trigger_mode.currentData(),
             output_on_at_start=self.output_on_start.isChecked(),
             output_off_at_end=self.output_off_end.isChecked())
@@ -758,7 +801,8 @@ class MainWindow(QMainWindow):
             present = self.info is None or ch in self.info.channels
             panel.setVisible(present)
             panel.set_running(self._running)
-        for w in (self.rate, self.duration, self.trigger_mode, self.output_on_start, self.output_off_end):
+        for w in (self.rate, self.duration, self.timebase, self.trigger_mode, self.output_on_start,
+                  self.output_off_end):
             w.setEnabled(not self._running)
         self.run_btn.setText("Stop" if self._running else "Run")
         can_run = connected and not self._busy and bool(self.measured_channels())
@@ -774,10 +818,19 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _max_duration(self, rate: SampleRate, channels: int, mode: TriggerMode) -> float:
-        """Longest capture that fits the memory budget (two captures may be in memory at once)."""
+        """Longest capture (or roll span) that fits the memory budget.
+
+        Two captures may be in memory at once. In roll mode those are two buffers, each the span
+        plus its slack, and a copy in flight when one replaces the other.
+        """
         budget = psutil.virtual_memory().available * MEMORY_FRACTION
         samples = budget / (BYTES_PER_SAMPLE * max(1, channels) * 2)
+        if mode is TriggerMode.ROLL:
+            samples /= (1 + ROLL_SLACK) * 1.2
         return max(CHUNK_PERIOD, math.floor(samples / rate.hz * 100) / 100)
+
+    def _roll_span(self) -> float:
+        return self.timebase.currentData() * ROLL_DIVISIONS
 
     def _update_summary(self) -> None:
         channels = max(1, len(self.measured_channels()))
@@ -790,10 +843,29 @@ class MainWindow(QMainWindow):
             self.rate.setCurrentIndex(self.rate.findData(rate))
         mode = self.trigger_mode.currentData()
         max_duration = self._max_duration(rate, channels, mode)
+        rolling = mode is TriggerMode.ROLL
+        self._acquisition_form.setRowVisible(self.duration, not rolling)
+        self._acquisition_form.setRowVisible(self.timebase_row, rolling)
+        link = rate.hz * 8 * channels
+        if rolling:
+            # Time bases whose span doesn't fit in memory can't be chosen.
+            model = self.timebase.model()
+            fits = [self.timebase.itemData(i) * ROLL_DIVISIONS <= max_duration for i in range(self.timebase.count())]
+            for i, ok in enumerate(fits):
+                model.item(i).setEnabled(ok)
+            if not fits[self.timebase.currentIndex()]:
+                self.timebase.setCurrentIndex(max((i for i, ok in enumerate(fits) if ok), default=0))
+            span = self._roll_span()
+            samples = max(1, round(span * rate.hz))
+            size = roll_capacity(samples, rate.chunk_samples) * BYTES_PER_SAMPLE * channels
+            self.span_label.setText(f"span {format_span(span)}")
+            self.summary.setText(
+                f"{samples:,} samples per channel · {si(size, 'B', 3)} in memory\n"
+                f"Link {si(link, 'B/s', 3)} · runs until Stop")
+            return
         self.duration.setMaximum(max_duration)
         samples = max(1, round(self.duration.value() * rate.hz))
         size = samples * BYTES_PER_SAMPLE * channels
-        link = rate.hz * 8 * channels
         self.summary.setText(
             f"{samples:,} samples per channel · {si(size, 'B', 3)} in memory\n"
             f"Link {si(link, 'B/s', 3)} · max {format_duration(max_duration)} (memory)")
@@ -941,22 +1013,40 @@ class MainWindow(QMainWindow):
     def _on_capture_started(self, capture: Capture) -> None:
         self._armed = False
         self._capturing = True
-        self._set_progress(maximum=capture.target)
+        if capture.rolling:
+            self._set_progress(busy=True)
+        else:
+            self._set_progress(maximum=capture.target)
         first = self._new_run
         self._new_run = False
         self._show(capture, fit=first)
+        if capture.rolling:
+            self._start_rolling(capture)
         self.statusBar().showMessage(f"Capture {capture.number}: waiting for data…")
         self._update_controls()
 
     @Slot(object)
     def _on_progress(self, capture: Capture) -> None:
+        rolling = capture.rolling and self._capturing
         if capture is not self.capture:
-            return
+            if not rolling:
+                return
+            # The roll buffer filled and the worker continued in a new one: same data, shifted.
+            self.capture = capture
+            for (q, ch), curve in self.curves.items():
+                curve.set_source(capture.channels.get(ch), q, capture.interval, capture.offset)
         n = capture.n
         for curve in self.curves.values():
             curve.data_changed()
         self._refresh_bands()
         self.measurements.set_capture(capture, capturing=True)
+        if rolling:
+            end = capture.time_of(n)
+            if end > self._roll_end:
+                self._roll_end, self._roll_arrival = end, time.monotonic()
+            self.statusBar().showMessage(
+                f"Rolling: {format_duration(end)} elapsed, showing the last {format_span(capture.config.duration)}")
+            return
         self.progress.setValue(n)
         self.statusBar().showMessage(
             f"Capture {capture.number}: {n:,} / {capture.target:,} samples ({format_duration(n * capture.interval)})")
@@ -975,6 +1065,12 @@ class MainWindow(QMainWindow):
             return
         self._show(capture)
         n = capture.n
+        if capture.rolling:
+            self._stop_rolling()
+            self.statusBar().showMessage(
+                f"Stopped after {format_duration(capture.time_of(n))}; kept the last "
+                f"{format_duration(n * capture.interval)} ({n:,} samples)", 10000)
+            return
         self.statusBar().showMessage(f"Capture {capture.number}: {n:,} samples in {format_duration(n * capture.interval)}"
                                      f"{'' if capture.complete else ' (partial)'}", 10000)
 
@@ -982,6 +1078,7 @@ class MainWindow(QMainWindow):
     def _on_run_finished(self) -> None:
         stopped = self._stopping
         self._running = self._stopping = self._armed = self._capturing = False
+        self._roll_timer.stop()
         if self.capture is not None:
             self._set_progress(maximum=max(1, self.capture.target), value=self.capture.n)
             self._show(self.capture)
@@ -1021,14 +1118,25 @@ class MainWindow(QMainWindow):
         dt = capture.interval
         for (q, ch), curve in self.curves.items():
             data = capture.channels.get(ch)
-            curve.set_source(data, q, dt)
+            curve.set_source(data, q, dt, capture.offset)
             curve.setVisible(data is not None)
-        end = max(capture.target - 1, 1) * dt
+        start, end = capture.t0, capture.time_of(max(capture.target - 1, 1))
+        scrolling = capture.rolling and self._capturing     # the view follows the data; see _roll_frame
+        division = capture.config.duration / ROLL_DIVISIONS if capture.rolling else None
         for p in self.plots.values():
-            p.getViewBox().setLimits(xMin=0, xMax=end, minXRange=5 * dt)
+            vb = p.getViewBox()
+            if scrolling:
+                vb.setLimits(xMin=None, xMax=None, minXRange=5 * dt)
+            else:
+                vb.setLimits(xMin=start, xMax=end, minXRange=5 * dt)
+            vb.setMouseEnabled(x=not scrolling, y=True)
+            p.getAxis("bottom").set_division(division)
         if fit:
             vb = self._visible_plots()[0].getViewBox()
-            vb.setXRange(0, end, padding=0)
+            if scrolling:
+                vb.setXRange(-capture.config.duration, 0, padding=0)
+            else:
+                vb.setXRange(start, end, padding=0)
             for p in self.plots.values():
                 p.getViewBox().enableAutoRange(y=True)
         self._update_title()
@@ -1039,6 +1147,38 @@ class MainWindow(QMainWindow):
         self._update_stats()
         self.measurements.set_capture(capture, self._capturing)
 
+    # Roll mode: the plots always show the last span, and scroll as data arrives.
+
+    def _start_rolling(self, capture: Capture) -> None:
+        self._roll_end, self._roll_arrival = capture.t0, time.monotonic()
+        self._roll_shown = None
+        self._roll_stats_due = 0.0
+        self._roll_timer.start()
+
+    def _roll_frame(self) -> None:
+        """Scroll the plots so their right edge follows the data, ROLL_LATENCY behind the newest sample."""
+        cap = self.capture
+        if cap is None or not (cap.rolling and self._capturing):
+            return
+        span = cap.config.duration
+        now = time.monotonic()
+        edge = min(self._roll_end, self._roll_end + (now - self._roll_arrival) - ROLL_LATENCY)
+        vb = self._visible_plots()[0].getViewBox()
+        pixel = span / max(1.0, vb.width())
+        if self._roll_shown is None or edge - self._roll_shown >= pixel / 2:      # never backwards
+            self._roll_shown = edge
+            vb.setXRange(edge - span, edge, padding=0)
+        if now >= self._roll_stats_due and cap.n:
+            self._update_stats(live=True)
+            self._roll_stats_due = now + max(ROLL_STATS_PERIOD, 10 * (time.monotonic() - now))
+
+    def _stop_rolling(self) -> None:
+        """Leave the plots on the span that was kept."""
+        self._roll_timer.stop()
+        cap = self.capture
+        end = cap.time_of(max(cap.n - 1, 1))
+        self._visible_plots()[0].getViewBox().setXRange(max(cap.t0, end - cap.config.duration), end, padding=0)
+
     def _update_title(self) -> None:
         cap = self.capture
         if cap is None:
@@ -1048,8 +1188,9 @@ class MainWindow(QMainWindow):
             s = data.settings
             parts.append(f"{colored(f'CH{ch}', ch)} {s.voltage_set:g} V, {si(s.current_set, 'A', 3)} limit, "
                          f"ranges {range_label(s.voltage_range, 'V')} / {range_label(s.current_range, 'A')}")
+        what = f"roll {format_span(cap.config.duration / ROLL_DIVISIONS)}/div" if cap.rolling else f"#{cap.number}"
         title = (f"{cap.device.model} · {format_rate(cap.sample_rate)} · " + " · ".join(parts)
-                 + f" · #{cap.number} {cap.started:%Y-%m-%d %H:%M:%S}")
+                 + f" · {what} {cap.started:%Y-%m-%d %H:%M:%S}")
         for p in self.plots.values():
             p.setTitle(None)
         self._visible_plots()[0].setTitle(title, size="9pt")
@@ -1090,13 +1231,13 @@ class MainWindow(QMainWindow):
                         clipped.append(ch.current_clipped.array())
             m = merge_intervals(*missing) if self.show_missing.isChecked() else np.empty((0, 2))
             c = merge_intervals(*clipped) if self.show_clipped.isChecked() else np.empty((0, 2))
-            dt = cap.interval if cap is not None else 1.0
+            dt, off = (cap.interval, cap.offset) if cap is not None else (1.0, 0)
             for bands, runs in ((self.missing_bands[q], m), (self.clipped_bands[q], c)):
-                bands.set_intervals((runs[:, 0] - 0.5) * dt, (runs[:, 1] - 0.5) * dt)
+                bands.set_intervals((off + runs[:, 0] - 0.5) * dt, (off + runs[:, 1] - 0.5) * dt)
             if self.show_quantity[q].isChecked():
                 events += [m, c]
         merged = merge_intervals(*events) if cap is not None else np.empty((0, 2))
-        self._events = merged * (cap.interval if cap is not None else 1.0)
+        self._events = (merged + cap.offset) * cap.interval if cap is not None else merged
         self._event_nav = None
         self._update_event_buttons()
 
@@ -1139,8 +1280,8 @@ class MainWindow(QMainWindow):
     def _fit(self) -> None:
         if self.capture is None:
             return
-        end = max(self.capture.n - 1, 1) * self.capture.interval
-        self._visible_plots()[0].getViewBox().setXRange(0, end, padding=0.01)
+        cap = self.capture
+        self._visible_plots()[0].getViewBox().setXRange(cap.t0, cap.time_of(max(cap.n - 1, 1)), padding=0.01)
         for p in self.plots.values():
             p.getViewBox().enableAutoRange(y=True)
 
@@ -1228,18 +1369,18 @@ class MainWindow(QMainWindow):
             self.measurements.place_marker(name, quantity, point)
 
     def _visible_samples(self) -> tuple[int, int]:
-        return samples_between(*self._view_range(), self.capture.interval, self.capture.n)
+        return self.capture.samples_between(*self._view_range())
 
     def _target_event(self, step: int) -> int | None:
         """Index of the highlighted interval Previous (-1) or Next (+1) would jump to."""
         events = self._events
         if self.capture is None or self._capturing or len(events) == 0:
             return None
-        dt = self.capture.interval
+        dt, t0 = self.capture.interval, self.capture.t0
         x0, x1 = self._view_range()
         if self._event_nav is not None and np.allclose(self._event_nav[1], (x0, x1), rtol=0, atol=dt / 10):
             i = self._event_nav[0] + step
-        elif x0 <= dt and x1 >= (self.capture.n - 2) * dt:
+        elif x0 <= t0 + dt and x1 >= t0 + (self.capture.n - 2) * dt:
             i = 0 if step > 0 else len(events) - 1
         else:
             centers = events.mean(axis=1)
@@ -1277,9 +1418,11 @@ class MainWindow(QMainWindow):
         self.prev_event_btn.setEnabled(self._target_event(-1) is not None)
         self.next_event_btn.setEnabled(self._target_event(1) is not None)
 
-    def _update_stats(self) -> None:
+    def _update_stats(self, live: bool = False) -> None:
+        """Statistics of the displayed window. They wait for a capture to finish, except in roll
+        mode, which asks for them now and then (live)."""
         cap = self.capture
-        if cap is None or self._capturing:
+        if cap is None or (self._capturing and not live):
             return
         start, stop = self._visible_samples()
         if stop <= start:
@@ -1344,19 +1487,19 @@ class MainWindow(QMainWindow):
                 break
         else:
             return
-        i = round(t / cap.interval)
+        i = cap.index_at(t)
         if not 0 <= i < cap.n:
             return
         values = []
         for ch, data in cap.channels.items():
             v, a = float(data.voltage[i]), float(data.current[i])
             values.append((ch, v, a, v * a))
-        self.cursor_label.setText(self._cursor_text(i, i * cap.interval, values))
+        self.cursor_label.setText(self._cursor_text(cap.offset + i, cap.time_of(i), values))
 
     @staticmethod
     def _cursor_text(i: int, t: float, values: list[tuple[int, float, float, float]]) -> str:
         """The sample under the mouse: index, time, and per channel (channel, V, I, P)."""
-        parts = [f"#{i:,} &nbsp; t = {si(t, 's', 7)}"]
+        parts = [f"#{i:,} &nbsp; t = {format_time(t)}"]
         for ch, v, a, p in values:
             if math.isnan(v):
                 parts.append(f"{colored(f'CH{ch}', ch)} missing")

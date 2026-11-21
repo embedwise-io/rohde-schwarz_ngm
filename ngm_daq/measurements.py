@@ -15,9 +15,9 @@ import pyqtgraph as pg
 from PyQt6.QtCore import QPointF, Qt, QTimer, pyqtSignal as Signal
 from PyQt6.QtWidgets import QComboBox, QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
-from .capture import QUANTITIES, UNITS, Capture, box_stats, samples_between
+from .capture import QUANTITIES, UNITS, Capture, box_stats
 from .plotting import (
-    QUANTITY_LABELS, X_MARKER_COLOR, Y_MARKER_COLOR, MarkerLine, SelectionBox, colored, si,
+    QUANTITY_LABELS, X_MARKER_COLOR, Y_MARKER_COLOR, MarkerLine, SelectionBox, colored, format_time, si,
 )
 
 X_MARKERS = ("X1", "X2")
@@ -37,7 +37,7 @@ WIDEST_STAT_LABEL = "Points in time range"
 
 
 def _value(value: float, unit: str) -> str:
-    return si(value, unit, PRECISION[unit])
+    return format_time(value, PRECISION[unit]) if unit == "s" else si(value, unit, PRECISION[unit])
 
 
 def _reciprocal(delta: float, unit: str) -> str:
@@ -334,7 +334,7 @@ class MeasurementsPanel(QWidget):
         for ch, data in cap.channels.items():
             values = []
             for t in times:
-                i = round(t / cap.interval) if t is not None else -1
+                i = cap.index_at(t) if t is not None else -1
                 v, a = (float(data.voltage[i]), float(data.current[i])) if 0 <= i < n else (math.nan, math.nan)
                 values.append({"voltage": v, "current": a, "power": v * a})
             result.append((ch, *values))
@@ -354,10 +354,10 @@ class MeasurementsPanel(QWidget):
             return html
         if self._capturing:
             return html + "<br><i>Statistics follow when the capture is complete.</i>"
-        key = (q, x0, x1, y0, y1, id(cap), cap.number, cap.started, cap.n)
+        key = (q, x0, x1, y0, y1, id(cap), cap.number, cap.started, cap.offset, cap.n)
         if self._stats_cache is not None and self._stats_cache[0] == key:
             return html + self._stats_cache[1]
-        start, stop = samples_between(x0, x1, cap.interval, cap.n)
+        start, stop = cap.samples_between(x0, x1)
         if not final and (stop - start) * len(cap.channels) > LIVE_SAMPLES:
             return html + "<br><i>Updating…</i>"
         stats = {ch: box_stats(data, q, start, stop, y0, y1) for ch, data in cap.channels.items()}

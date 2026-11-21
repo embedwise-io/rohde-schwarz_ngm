@@ -64,11 +64,20 @@ installation is needed. HiSLIP and VXI-11 go through pyvisa-py.
      stop part-way through a capture, the last complete one stays on screen.
    - **Manual:** Run arms FastLog; each **Trigger** press (F6) takes one capture, then it
      re-arms until **Stop**.
+   - **Roll (continuous):** like an oscilloscope's roll mode or a strip-chart recorder. The
+     plots scroll from right to left until **Stop**, for watching slow signals over a long
+     time. **Time base** replaces the acquisition time: it sets the time per division, from
+     10 ms/div to 1 h/div, and the plots show 10 divisions (100 ms/div is a 1 s span).
+     Only that span is kept: older samples are discarded as new ones arrive, so a run can
+     last for hours without using more memory. After **Stop**, the span on screen is the
+     capture: zoom in, measure, or save it as usual. The time axis counts from the start
+     of the run, and so do the times in saved files.
 
    **Switch outputs on after start** switches on the measured channels' outputs once FastLog
    delivers its first data. The capture then shows about 0.6 s of baseline, the turn-on and
    the inrush. **Switch outputs off at the end** switches them off when the run ends.
-   The acquisition time is limited by memory; the summary line shows the limit.
+   The acquisition time is limited by memory; the summary line shows the limit. In roll
+   mode, time bases whose span doesn't fit in memory can't be chosen.
 4. Press **Run** (F5). Data plots live as it arrives, in stacked voltage, current and power
    plots that share the time axis (CH1 orange, CH2 blue, as on the instrument).
 5. Zoom with the toolbar buttons, the mouse wheel, or **Box Zoom**, and use **Show V I P** to
@@ -133,8 +142,9 @@ the instrument.
 current are NaN). Power isn't stored; it is voltage × current.
 
 HDF5 files don't store a time column, because samples are evenly spaced. Rebuild it from the
-`t0_s` and `sample_interval_s` attributes; `t0_s` is non-zero for a **Save View** slice. The
-files use the modern HDF5 format, readable by HDF5 1.14 and later.
+`t0_s` and `sample_interval_s` attributes; `t0_s` is non-zero for a **Save View** slice, and
+for a roll-mode capture, where it is the time since the start of the run. The files use the
+modern HDF5 format, readable by HDF5 1.14 and later.
 
 ```python
 import pandas as pd
@@ -194,6 +204,14 @@ plots don't hand those to pyqtgraph: each channel keeps min/max summaries at sev
 resolutions as data arrives, and a redraw takes one min/max pair per pixel column (or the
 raw samples when zoomed in), so it costs the same at any capture length.
 
+**Roll mode.** The instrument thread fills a buffer that holds the span plus half as much
+again (at least 2 s of data). When the buffer is nearly full, the thread prepares a new one
+that starts with the newest span, hands it to the display, and drops the old one, so memory
+stays the same however long the run lasts. It copies the span about a million samples at a
+time between polls: copying a long span in one go would keep it from the instrument for
+longer than a chunk lasts. Data arrives in 250 ms chunks, so the display runs 0.3 s behind
+the newest sample and reveals each chunk at an even pace.
+
 **Instrument quirks the app works around** (NGM202, firmware 04.013):
 
 - **Combined rate limit.** If FastLog runs on both channels at more than 500 kSa/s combined
@@ -247,7 +265,7 @@ Bluetooth-device-like load on CH1:
 ```
 
 `uv sync --extra test && .venv/bin/pytest` runs the unit tests, and the worker and main
-window against the simulator, in about 45 s. (A plain `uv sync` removes pytest again.)
+window against the simulator, in about 55 s. (A plain `uv sync` removes pytest again.)
 
 ## Notes
 

@@ -9,6 +9,10 @@ it records:
 - clipped samples: readings pinned at the measurement range's limit (see clipped_mask);
 - min/max pyramids, so that a plot of hundreds of millions of samples redraws in milliseconds.
 
+In roll mode a capture is a sliding window on an endless stream: `offset` counts the samples that
+have rolled out before sample 0, and the time axis runs from the start of the run, so sample i is
+at (offset + i) × interval.
+
 Nothing here depends on Qt; the worker thread appends while the GUI thread reads. Appends only
 write beyond the published sample count, so a reader that snapshots `n` first sees consistent data.
 """
@@ -52,13 +56,14 @@ class TriggerMode(enum.Enum):
     SINGLE = "Single"
     AUTO = "Auto (continuous)"
     MANUAL = "Manual"
+    ROLL = "Roll (continuous)"
 
 
 @dataclass(frozen=True)
 class RunConfig:
     channels: tuple[ChannelSetup, ...]
     rate: SampleRate
-    duration: float                    # s per capture
+    duration: float                    # s per capture; in roll mode, the span kept and displayed
     mode: TriggerMode = TriggerMode.SINGLE
     output_on_at_start: bool = False   # switch measured outputs on once the first chunk has arrived
     output_off_at_end: bool = False    # switch measured outputs off when the run ends
@@ -112,6 +117,16 @@ class IntervalList:
 
     def __len__(self) -> int:
         return len(self._stops)
+
+    def shifted(self, drop: int, stop: int) -> IntervalList:
+        """These runs with sample `drop` as the new sample 0, limited to [0, stop)."""
+        runs = self.array()
+        a = np.clip(runs[:, 0] - drop, 0, stop)
+        b = np.clip(runs[:, 1] - drop, 0, stop)
+        keep = b > a
+        out = IntervalList()
+        out._starts, out._stops = a[keep].tolist(), b[keep].tolist()
+        return out
 
 
 def merge_intervals(*arrays: np.ndarray) -> np.ndarray:
@@ -322,6 +337,36 @@ class ChannelData:
         self._update(start, start + k)
         return k
 
+    def rolled(self, drop: int, capacity: int | None = None) -> ChannelData:
+        """A new buffer holding this one's samples from `drop` on (as many as fit `capacity`).
+
+        Roll mode makes room this way instead of shifting in place, so a reader of this buffer
+        on another thread never sees samples move.
+        """
+        new = ChannelData(self.settings, self.capacity if capacity is None else capacity)
+        new.copy_from(self, drop, self.n)
+        return new
+
+    def copy_from(self, source: ChannelData, drop: int, limit: int) -> bool:
+        """Continue copying `source`'s samples from `drop` on into this buffer, at most `limit` per call.
+
+        Returns True once this buffer has all of them (or is full), flags included. Copying in
+        steps lets the instrument thread keep polling while a long buffer rolls.
+        """
+        start = self.n
+        end = max(start, min(source.n - drop, self.capacity))
+        stop = min(end, start + limit)
+        if stop > start:
+            self.voltage[start:stop] = source.voltage[drop + start:drop + stop]
+            self.current[start:stop] = source.current[drop + start:drop + stop]
+            self._update(start, stop)
+        if stop < end:
+            return False
+        self.missing = source.missing.shifted(drop, stop)
+        self.voltage_clipped = source.voltage_clipped.shifted(drop, stop)
+        self.current_clipped = source.current_clipped.shifted(drop, stop)
+        return True
+
     def _detect_clipping(self, start: int, stop: int) -> None:
         # Two samples of context so autorange runs that straddle chunks are found.
         ctx = min(start, AUTO_CLIP_RUN - 1)
@@ -381,6 +426,7 @@ class Capture:
     number: int = 1                    # capture number within the run
     first_sample: int = 0              # index of sample 0 in the FastLog stream (Auto mode frames)
     warnings: list[str] = field(default_factory=list)
+    offset: int = 0                    # roll mode: samples that rolled out before sample 0
 
     @property
     def target(self) -> int:
@@ -402,6 +448,26 @@ class Capture:
     def duration(self, n: int | None = None) -> float:
         return (self.n if n is None else n) * self.interval
 
+    @property
+    def rolling(self) -> bool:
+        return self.config.mode is TriggerMode.ROLL
+
+    @property
+    def t0(self) -> float:
+        """Time of sample 0 on the time axis (s)."""
+        return self.offset * self.interval
+
+    def time_of(self, index: int) -> float:
+        return (self.offset + index) * self.interval
+
+    def index_at(self, t: float) -> int:
+        """Index of the sample nearest to time t (may be outside the data)."""
+        return round(t / self.interval) - self.offset
+
+    def samples_between(self, t0: float, t1: float) -> tuple[int, int]:
+        """Sample range [start, stop) whose times lie in [t0, t1]."""
+        return samples_between(t0 - self.t0, t1 - self.t0, self.interval, self.n)
+
     def metadata(self) -> dict[str, str]:
         d = self.device
         meta = {
@@ -413,6 +479,7 @@ class Capture:
             "resource": d.resource,
             "started": self.started.isoformat(timespec="milliseconds"),
             "trigger": self.config.mode.value,
+            **({"roll_span_s": f"{self.config.duration:g}"} if self.rolling else {}),
             "capture_number": str(self.number),
             "sample_interval_s": f"{self.interval:.9g}",
             "sample_rate_hz": f"{self.sample_rate:.9g}",

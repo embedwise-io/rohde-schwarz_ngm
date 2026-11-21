@@ -382,3 +382,61 @@ def test_selection_counts_and_time_in_box(app, win):
     assert selection.index("Points in time range") < selection.index("Points in box")
     for text in ("2,000", "820", "820 ms (41.0%)", "0 s (0.0%)"):
         assert text in selection, text
+
+
+# --- Roll mode: a capture that starts an hour into its run -------------------------------
+
+HOUR = 3_600_000                    # samples at 1 kSa/s
+
+
+@pytest.fixture
+def rolled(app, win):
+    import dataclasses
+
+    from ngm_daq.capture import TriggerMode
+    cap = make_capture()
+    cap = dataclasses.replace(cap, offset=HOUR,
+                              config=dataclasses.replace(cap.config, mode=TriggerMode.ROLL, duration=10.0))
+    win._show(cap, fit=True)
+    settle(app)
+    return cap
+
+
+def test_rolled_capture_is_shown_at_its_time_in_the_run(app, win, rolled):
+    assert x_range(win) == pytest.approx([3600.0, 3609.999])
+    assert win._visible_samples() == (0, N)
+    hover(app, win, 3602.057)                                # sample 2057 of the buffer: 5.7 mA
+    text = win.cursor_label.text()
+    assert "#3,602,057" in text and "t = 3602.057 s" in text and "5.7 mA" in text
+    curve = win.curves["current", 1]
+    assert curve.value_at(3602.057) == pytest.approx(0.0057)
+    assert curve.dataBounds(0) == pytest.approx((3600.0, 3609.999))
+    assert curve.dataBounds(1, orthoRange=(3602.010, 3602.020)) == pytest.approx((0.001, 0.002))
+    win.plots["voltage"].getViewBox().setXRange(3604.0, 3605.0, padding=0)
+    assert win._visible_samples() == (4000, 5001)
+    win._fit()
+    assert x_range(win) == pytest.approx([3600.0, 3609.999], abs=0.2)
+
+
+def test_markers_and_selection_on_a_rolled_capture(app, win, rolled):
+    m = win.measurements
+    m.place_marker("X1", "current", QPointF(3602.0123, 0))   # 1.2 mA
+    m.place_marker("X2", "current", QPointF(3602.0573, 0))   # 5.7 mA
+    m.drag_box("current", QPointF(3602.0, 0.00295), QPointF(3603.9995, 0.00705), True)
+    markers, selection = readouts(app, win)
+    for text in ("3602.0123 s", "3602.0573 s", "45 ms", "1.2 mA", "5.7 mA"):
+        assert text in markers, text
+    for text in ("2,000", "820", "820 ms (41.0%)"):
+        assert text in selection, text
+
+
+def test_highlights_on_a_rolled_capture(app, win):
+    import dataclasses
+
+    from test_export import make_capture as capture_with_flags
+    cap = dataclasses.replace(capture_with_flags(), offset=1000)        # 1 s in, at 1 kSa/s
+    win._show(cap, fit=True)
+    # CH1: clipped samples 100-109 and missing samples 5000-5249 of the buffer.
+    assert win._events == pytest.approx(np.array([[1.100, 1.110], [6.000, 6.250]]))
+    bands = win.missing_bands["current"]
+    assert (bands._starts[0], bands._stops[0]) == pytest.approx((5.9995, 6.2495))

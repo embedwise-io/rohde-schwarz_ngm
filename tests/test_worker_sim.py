@@ -175,3 +175,68 @@ def test_setpoint_change_during_capture(app, connected):
     assert v[-int(0.3 * 50e3):].mean() == pytest.approx(3.3, abs=0.02)
     assert rec.status[1].voltage_set == pytest.approx(3.3)
     worker.set_output(1, False)
+
+
+def test_roll_mode_keeps_only_the_span(app, connected):
+    worker, rec, _ = connected
+    seen = []
+    worker.progress.connect(seen.append)
+    cfg = RunConfig((ChannelSetup(1), ChannelSetup(2)), SampleRate.R10K, duration=0.5, mode=TriggerMode.ROLL)
+    worker.run(cfg)
+    wait_for(app, lambda: seen and seen[-1].offset + seen[-1].n >= 40_000)        # 4 s: several times the buffer
+    worker.request_stop()
+    wait_for(app, lambda: "finished" in rec.events)
+    assert not [e for e in rec.events if isinstance(e, tuple)], rec.events
+    # While running: bounded buffers that slide along the stream, never losing the span.
+    capacity = 5000 + 8 * 2500
+    assert all(c.target == capacity for c in seen)
+    offsets = [c.offset for c in seen]
+    assert offsets == sorted(offsets) and len(set(offsets)) >= 3 and offsets[0] == 0
+    assert all(c.n >= 5000 for c in seen if c.offset)
+    # At the end: exactly the span, on both channels, ending where the stream ended.
+    final = rec.captures[-1]
+    assert final.n == 5000 and final.complete and final.offset >= 35_000
+    assert final.offset + final.n >= seen[-1].offset + seen[-1].n
+    assert final.t0 == pytest.approx(final.offset * 1e-4)
+    for ch in final.channels.values():
+        assert ch.n == 5000 and len(ch.missing) == 0 and np.isfinite(ch.voltage).all()
+
+
+def test_roll_keeps_samples_and_flags_in_place():
+    from ngm_daq.capture import ChannelData, ChannelSettings
+    ch = ChannelData(ChannelSettings(1, 4.2, 0.1, True, 5.0, 0.01), 1000)
+    k = np.arange(600)
+    i = np.full(600, 0.002)
+    i[400:410] = 0.0113391                                  # clipped on the 10 mA range
+    ch.append(np.column_stack((k * 1e-3, i)).astype(np.float32))
+    ch.append_missing(100)
+    rolled = ch.rolled(drop=384)
+    assert rolled.n == 316 and rolled.capacity == 1000
+    assert rolled.voltage[:216] == pytest.approx(np.arange(384, 600) * 1e-3, rel=1e-6)
+    assert rolled.current_clipped.array().tolist() == [[16, 26]]
+    assert rolled.missing.array().tolist() == [[216, 316]] and np.isnan(rolled.voltage[216:316]).all()
+    lo, hi = rolled.pyramids["voltage"].binned(0, 0, 216, np.array([0]))
+    assert (lo[0], hi[0]) == pytest.approx((0.384, 0.599), rel=1e-6)
+    trimmed = ch.rolled(drop=650, capacity=50)
+    assert trimmed.n == 50 and trimmed.full and trimmed.missing.array().tolist() == [[0, 50]]
+
+
+def test_copying_in_steps_matches_rolling_at_once():
+    from ngm_daq.capture import ChannelData, ChannelSettings
+    rng = np.random.default_rng(0)
+    source = ChannelData(ChannelSettings(1, 4.2, 0.1, True, 5.0, 0.01), 5000)
+    source.append(rng.normal(1.0, 0.1, (1500, 2)).astype(np.float32))
+    source.append_missing(300)
+    new = ChannelData(source.settings, 5000)
+    assert not new.copy_from(source, 700, 400)               # 400 of 1,100 so far
+    source.append(rng.normal(1.0, 0.1, (900, 2)).astype(np.float32))     # the old buffer keeps filling
+    while not new.copy_from(source, 700, 400):
+        pass
+    once = source.rolled(700)
+    assert new.n == once.n == 2000
+    assert np.array_equal(new.voltage[:2000], once.voltage[:2000], equal_nan=True)
+    assert new.missing.array().tolist() == once.missing.array().tolist() == [[800, 1100]]
+    for q in ("voltage", "current", "power"):
+        a, b = new.pyramids[q], once.pyramids[q]
+        assert a.counts == b.counts
+        assert all(np.array_equal(x[:c], y[:c], equal_nan=True) for x, y, c in zip(a.mins, b.mins, a.counts))

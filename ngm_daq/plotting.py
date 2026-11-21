@@ -27,6 +27,8 @@ BAND_MIN_WIDTH_PX = 3             # a single flagged sample stays visible when z
 BOUNDS_RAW_LIMIT = 1_000_000      # y auto-range uses raw samples up to this many, else the pyramid
 STYLES = ("Line", "Line + points", "Points")
 TICK_DIGITS = 8                   # significant digits in y tick labels: one more than float32 resolves
+TIME_TICK_DIGITS = 12             # ... in time tick labels: µs steps after hours of rolling
+ROLL_DIVISIONS = 10               # time divisions across the plots in roll mode
 
 CHANNEL_COLORS = {1: "#ff9f1a", 2: "#3fa9f5"}     # the instrument's Ch1 orange and Ch2 blue
 QUANTITY_LABELS = {"voltage": "Voltage", "current": "Current", "power": "Power"}
@@ -40,6 +42,13 @@ def si(value: float, unit: str, precision: int = 5) -> str:
     if value is None or not math.isfinite(value):
         return "—"
     return pg.siFormat(value, precision=precision, suffix=unit)
+
+
+def format_time(t: float, precision: int = 7) -> str:
+    """A point in time: like si(), but from 1000 s on in plain seconds (3602.0123 s, not 3.602012 ks)."""
+    if t is None or not math.isfinite(t) or abs(t) < 1000:
+        return si(t, "s", precision)
+    return f"{t:.4f}".rstrip("0").rstrip(".") + " s"
 
 
 def colored(text: str, ch: int) -> str:
@@ -64,12 +73,47 @@ class ValueAxis(pg.AxisItem):
     def tickStrings(self, values, scale, spacing):
         if self.logMode:
             return super().tickStrings(values, scale, spacing)
-        scaled = [v * scale for v in values]
-        step = spacing * scale
-        whole = len(str(int(max(map(abs, scaled), default=0.0))))      # digits before the point
-        places = max(0, min(math.ceil(-math.log10(step)), TICK_DIGITS - whole))
-        # Rounding can leave a zero tick at -1e-17, which would print as -0.00.
-        return [f"{0.0 if abs(v) < step * 1e-3 else v:.{places}f}" for v in scaled]
+        return tick_strings(values, scale, spacing)
+
+
+def tick_strings(values, scale: float, spacing: float, digits: int = TICK_DIGITS) -> list[str]:
+    """Tick labels with as many decimals as the spacing needs, up to `digits` significant digits."""
+    scaled = [v * scale for v in values]
+    step = spacing * scale
+    whole = len(str(int(max(map(abs, scaled), default=0.0))))      # digits before the point
+    places = max(0, min(math.ceil(-math.log10(step)), digits - whole))
+    # Rounding can leave a zero tick at -1e-17, which would print as -0.00.
+    return [f"{0.0 if abs(v) < step * 1e-3 else v:.{places}f}" for v in scaled]
+
+
+class TimeAxis(pg.AxisItem):
+    """Time axis that can keep a fixed number of divisions, as in an oscilloscope's roll mode.
+
+    With `division` set (s per division) and ROLL_DIVISIONS of them in view, ticks sit on every
+    division. Zoomed to any other width, ticks are automatic again. Long runs stay in seconds
+    (no ks), with enough digits to tell neighbouring ticks apart.
+    """
+
+    def __init__(self, orientation: str = "bottom", **kwargs):
+        super().__init__(orientation, **kwargs)
+        self.division: float | None = None
+
+    def getSIPrefixEnableRanges(self):
+        return ((0.0, 999.9999),)           # ms, µs; never ks
+
+    def set_division(self, division: float | None) -> None:
+        self.division = division
+        self.picture = None
+        self.update()
+
+    def tickSpacing(self, minVal, maxVal, size):
+        div = self.division
+        if div and abs((maxVal - minVal) / div - ROLL_DIVISIONS) < 0.5:
+            return [(div, 0), (div / 5, 0)]
+        return super().tickSpacing(minVal, maxVal, size)
+
+    def tickStrings(self, values, scale, spacing):
+        return tick_strings(values, scale, spacing, digits=TIME_TICK_DIGITS)
 
 
 class EnvelopeCurve(pg.GraphicsObject):
@@ -83,6 +127,7 @@ class EnvelopeCurve(pg.GraphicsObject):
         self._data: ChannelData | None = None
         self._quantity = "voltage"
         self._dt = 1.0
+        self._offset = 0                # samples before sample 0 on the time axis (roll mode)
         self._style = STYLES[0]
         self._cache_key = None
         self._path = None
@@ -90,8 +135,9 @@ class EnvelopeCurve(pg.GraphicsObject):
 
     # --- Data ----------------------------------------------------------------------------
 
-    def set_source(self, data: ChannelData | None, quantity: str, dt: float) -> None:
-        self._data, self._quantity, self._dt = data, quantity, dt
+    def set_source(self, data: ChannelData | None, quantity: str, dt: float, offset: int = 0) -> None:
+        """Draw `data`, whose sample i is at time (offset + i) × dt."""
+        self._data, self._quantity, self._dt, self._offset = data, quantity, dt, offset
         self.data_changed()
 
     def data_changed(self) -> None:
@@ -107,7 +153,7 @@ class EnvelopeCurve(pg.GraphicsObject):
     def value_at(self, t: float) -> float | None:
         if self._data is None:
             return None
-        i = round(t / self._dt)
+        i = round(t / self._dt) - self._offset
         if 0 <= i < self._data.n:
             return float(self._data.series(self._quantity, i, i + 1)[0])
         return None
@@ -127,13 +173,13 @@ class EnvelopeCurve(pg.GraphicsObject):
         data = self._data
         if data is None or data.n == 0:
             return None, None
-        n, dt = data.n, self._dt
+        n, dt, off = data.n, self._dt, self._offset
         if ax == 0:
-            return 0.0, (n - 1) * dt
+            return off * dt, (off + n - 1) * dt
         i0, i1 = 0, n
         if orthoRange is not None:
-            i0 = max(0, math.floor(orthoRange[0] / dt))
-            i1 = min(n, math.ceil(orthoRange[1] / dt) + 1)
+            i0 = max(0, math.floor(orthoRange[0] / dt) - off)
+            i1 = min(n, math.ceil(orthoRange[1] / dt) + 1 - off)
         if i1 <= i0:
             return None, None
         if i1 - i0 <= BOUNDS_RAW_LIMIT:
@@ -157,14 +203,14 @@ class EnvelopeCurve(pg.GraphicsObject):
         px = self.pixelWidth()
         if data is None or view is None or not px or data.n == 0:
             return
-        n, dt = data.n, self._dt
-        i0 = max(0, math.floor(view.left() / dt))
-        i1 = min(n, math.ceil(view.right() / dt) + 1)
+        n, dt, off = data.n, self._dt, self._offset
+        i0 = max(0, math.floor(view.left() / dt) - off)
+        i1 = min(n, math.ceil(view.right() / dt) + 1 - off)
         if i1 <= i0:
             return
         width_px = max(1.0, view.width() / px)
         spp = (i1 - i0) / width_px                           # samples per pixel
-        key = (i0, i1, round(width_px), n, self._style)
+        key = (i0, i1, round(width_px), n, self._style, id(data))
         if key != self._cache_key:
             self._build(data, i0, i1, spp, px)
             self._cache_key = key
@@ -186,18 +232,19 @@ class EnvelopeCurve(pg.GraphicsObject):
             painter.restore()
 
     def _build(self, data: ChannelData, i0: int, i1: int, spp: float, px: float) -> None:
-        dt = self._dt
+        dt, off = self._dt, self._offset
         self._points = None
         if spp <= RAW_MAX_SAMPLES_PER_PX:
-            x = np.arange(i0, i1) * dt
+            x = (off + np.arange(i0, i1)) * dt
             y = data.series(self._quantity, i0, i1).astype(np.float64)
             spacing_px = dt / px
             if self._style == "Points" or (self._style == "Line + points" and spacing_px >= MARKER_MIN_SPACING):
                 self._points = _polygon(x, y)
         else:
-            # Bins on a fixed grid of whole samples, so they don't shimmer while panning.
+            # Bins on a fixed grid of whole samples (counted from the start of the run), so they
+            # don't shimmer while panning or rolling.
             width = max(1, math.ceil(spp))
-            edges = np.arange((i0 // width) * width, i1, width, dtype=np.int64)
+            edges = np.arange(((off + i0) // width) * width - off, i1, width, dtype=np.int64)
             edges[0] = max(edges[0], i0)
             pyr = data.pyramids[self._quantity]
             level = pyr.level_for(width)
@@ -205,7 +252,7 @@ class EnvelopeCurve(pg.GraphicsObject):
                 lo, hi = binned_raw(data.series(self._quantity, i0, i1), edges - i0)
             else:
                 lo, hi = pyr.binned(level, i0, i1, edges)
-            centers = (edges + width / 2) * dt
+            centers = (off + edges + width / 2) * dt
             x = np.repeat(centers, 2)
             y = np.column_stack((lo, hi)).ravel().astype(np.float64)
             if self._style == "Points":

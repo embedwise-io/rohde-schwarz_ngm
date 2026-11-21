@@ -2,6 +2,35 @@
 
 Notable changes to R&S NGM FastLog. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-11-21
+
+### Added
+
+- **Roll mode.** A fourth trigger mode, **Roll (continuous)**, acquires until Stop and
+  scrolls the plots from right to left like an oscilloscope's roll mode. **Time base** sets
+  the time per division, from 10 ms/div to 1 h/div in 1-2-5 steps; the plots show 10
+  divisions. Only the span on display is kept in memory: older samples are discarded as new
+  ones arrive, so a run can last for hours. After Stop, that span is the capture to zoom,
+  measure and save.
+  - The time axis, the readouts and saved files give the time since the start of the run.
+    Long runs stay in seconds (3602.01 s rather than 3.60201 ks).
+  - The plots scroll steadily although the instrument delivers data in 250 ms chunks: the
+    display runs 0.3 s behind the newest sample and reveals each chunk at an even pace.
+  - Statistics under the plots update about once a second while rolling. Markers and the
+    selection box work while rolling and scroll with the data.
+  - Lost and clipped samples are detected and highlighted as in the other modes.
+
+### Also
+
+- Tests for roll mode: the worker against the simulator, the main window end to end, and
+  captures that start an hour into a run (75 tests in total).
+
+### Verified
+
+- On the simulator: 500 kSa/s with a 10 s span for 30 s, through 8 buffer rollovers, with no
+  lost samples.
+- On an NGM202 (firmware 04.013): a short roll-mode run, with steady scrolling.
+
 ## [1.1.0] — 2026-11-01
 
 ### Added

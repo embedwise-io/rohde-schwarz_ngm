@@ -51,7 +51,7 @@ def save(path: str | Path, capture: Capture, start: int = 0, stop: int | None = 
     start = max(0, min(start, stop))
     meta = capture.metadata()
     meta["samples"] = str(stop - start)
-    meta["first_sample_index"] = str(start)
+    meta["first_sample_index"] = str(capture.offset + start)     # counted from the start of the run
     try:
         if fmt == "HDF5":
             _save_hdf5(path, capture, start, stop, meta, progress)
@@ -84,7 +84,7 @@ def _save_csv(path: Path, capture: Capture, start: int, stop: int, meta: dict[st
         f.write(",".join(columns) + "\n")
         for a in range(start, stop, BLOCK):
             b = min(stop, a + BLOCK)
-            cols = [np.arange(a, b) * capture.interval]
+            cols = [(capture.offset + np.arange(a, b)) * capture.interval]
             for ch in channels:
                 cols += [ch.voltage[a:b], ch.current[a:b], ch.flags(a, b)]
             rows = zip(*(c.tolist() for c in cols))
@@ -108,9 +108,9 @@ def _save_hdf5(path: Path, capture: Capture, start: int, stop: int, meta: dict[s
         f.attrs.update({
             "sample_interval_s": capture.interval,
             "sample_rate_hz": float(f"{capture.sample_rate:.9g}"),
-            "t0_s": start * capture.interval,
+            "t0_s": capture.time_of(start),
             "samples": n,
-            "first_sample_index": start,
+            "first_sample_index": capture.offset + start,
         })
         datasets = []
         for ch in capture.channels.values():

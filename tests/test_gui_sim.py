@@ -7,7 +7,10 @@ from conftest import wait_for
 from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtTest import QTest
 
+from ngm_daq import export
+from ngm_daq.capture import TriggerMode
 from ngm_daq.gui import MainWindow
+from ngm_daq.instrument import SampleRate
 
 # Commands that change a channel; connecting and monitoring must never send any of these.
 CHANGING = ("VOLT", "CURR", "OUTP", "SENS", "FLOG", "APPL", "*RST", "*TRG")
@@ -182,3 +185,39 @@ def test_channel_settings_are_not_remembered(app, window, settings):
     settings.sync()
     assert not settings.contains("ch1/current_range") and not settings.contains("ch1/voltage_range")
     assert settings.value("ch1/measure", type=bool) is True
+
+
+def test_roll_mode_scrolls_and_keeps_only_the_span(app, window, tmp_path):
+    win, sim = window
+    configure_instrument(sim)
+    connect(app, win)
+    win.trigger_mode.setCurrentIndex(win.trigger_mode.findData(TriggerMode.ROLL))
+    win.rate.setCurrentIndex(win.rate.findData(SampleRate.R10K))
+    win.timebase.setCurrentIndex(win.timebase.findData(0.1))            # 100 ms/div: a 1 s span
+    assert win.timebase_row.isVisible() and not win.duration.isVisible()
+    assert win.span_label.text() == "span 1 s" and win.current_config().duration == pytest.approx(1.0)
+    vb = win.plots["voltage"].getViewBox()
+    win._on_run()
+    wait_for(app, lambda: win.capture is not None and win.capture.offset > 0, 30)     # the buffer has rolled
+    wait_for(app, lambda: vb.viewRange()[0][1] > 2.0)
+    cap = win.capture
+    x0, x1 = vb.viewRange()[0]
+    assert x1 - x0 == pytest.approx(1.0)                                # always the span ...
+    assert cap.time_of(cap.n) - 0.7 < x1 <= cap.time_of(cap.n)          # ... ending just behind the newest sample
+    assert not vb.state["mouseEnabled"][0] and vb.state["mouseEnabled"][1]
+    assert cap.target == 30_000                                         # bounded, however long it runs
+    assert win.plots["power"].getAxis("bottom").tickSpacing(x0, x1, 1000)[0][0] == pytest.approx(0.1)
+    assert "CH1" in win.stats_label.text()                              # statistics follow while rolling
+    assert not win.save_all_btn.isEnabled()
+    win._on_run()                                                       # Stop
+    wait_for(app, lambda: not win._running)
+    cap = win.capture
+    assert cap.n == 10_000 and cap.offset >= 10_000                     # exactly the span remains
+    x0, x1 = vb.viewRange()[0]
+    assert (x0, x1) == pytest.approx((cap.t0, cap.time_of(cap.n - 1)))
+    assert vb.state["mouseEnabled"][0] and win.save_all_btn.isEnabled()
+    path = tmp_path / "roll.csv"
+    assert export.save(path, cap) == 10_000
+    rows = [line for line in path.read_text().splitlines() if not line.startswith("#")]
+    assert float(rows[1].split(",")[0]) == pytest.approx(cap.t0)        # times count from the start of the run
+    assert f"# first_sample_index: {cap.offset}" in path.read_text()

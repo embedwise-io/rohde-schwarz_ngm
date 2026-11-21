@@ -8,6 +8,10 @@ back to the GUI as Qt signals, which Qt delivers on the GUI thread.
 A chunk must be read within 250 ms of becoming available or the instrument replaces it. The
 thread only blocks on the instrument, so the GUI being busy doesn't cost data; anything lost
 anyway is detected (GapTracker) and stored as a gap.
+
+Roll mode streams without end into a sliding buffer: the span on display plus some slack. As the
+buffer fills, the thread prepares a new one from the old one's tail and then hands that to the
+GUI, so memory stays bounded however long the run lasts.
 """
 
 from __future__ import annotations
@@ -24,7 +28,9 @@ import pyvisa
 from PyQt6.QtCore import QObject, pyqtSignal as Signal
 from RsInstrument import RsInstrException, TimeoutException
 
-from .capture import Capture, ChannelData, ChannelSettings, GapTracker, RunConfig, TriggerMode
+from .capture import (
+    PYRAMID_BASE, PYRAMID_FACTOR, Capture, ChannelData, ChannelSettings, GapTracker, RunConfig, TriggerMode,
+)
 from .instrument import (
     FastLogConfig, InstrumentError, NgmPowerSupply,
 )
@@ -37,6 +43,14 @@ FIRST_CHUNK_GRACE = 1.5        # s after the trigger before a missing first chun
 STALL_TIMEOUT = 1.5            # s without a chunk before checking whether FastLog still runs
 STALL_GIVE_UP = 5.0            # s without a chunk before giving up although FastLog reports running
 RESTART_WAIT = 120.0           # s to wait for the instrument to come back after SYST:RESTart
+ROLL_SLACK = 0.5               # roll buffer: room beyond the span, as a fraction of it
+ROLL_SLACK_CHUNKS = 8          # ... and at least this many chunks
+ROLL_COPY_STEP = 1_000_000     # samples copied to the next roll buffer between polls (~10 ms per channel)
+
+
+def roll_capacity(span_samples: int, chunk_samples: int) -> int:
+    """Samples a roll-mode buffer holds: the span, plus slack so it rolls only now and then."""
+    return span_samples + max(int(span_samples * ROLL_SLACK), ROLL_SLACK_CHUNKS * chunk_samples)
 
 
 class FastLogStopped(InstrumentError):
@@ -58,6 +72,8 @@ class _Stream:
     last_stall_check: float = 0.0
     outputs_switched: bool = False
     size_warned: bool = False
+    roll_next: dict[int, ChannelData] | None = None     # roll mode: the buffers being prepared
+    roll_drop: int = 0                                   # ... and the samples they leave out
 
 
 class InstrumentWorker(QObject):
@@ -67,7 +83,7 @@ class InstrumentWorker(QObject):
     status = Signal(object)               # dict[int, ChannelStatus]
     armed = Signal()                      # waiting for a manual trigger
     capture_started = Signal(object)      # Capture
-    progress = Signal(object)             # Capture
+    progress = Signal(object)             # Capture (in roll mode, a new one each time the buffer rolls)
     acquired = Signal(object)             # Capture (complete, or partial when stopped)
     run_finished = Signal()
     message = Signal(str)                 # for the status bar
@@ -302,11 +318,13 @@ class InstrumentWorker(QObject):
                             break
                     stream = self._start_stream(channels, cfg)
                 number += 1
-                capture = self._new_capture(cfg, interval, stream, number)
+                rolling = cfg.mode is TriggerMode.ROLL
+                capacity = roll_capacity(cfg.samples, stream.chunk_samples) if rolling else cfg.samples
+                capture = self._new_capture(cfg, interval, stream, number, capacity)
                 self.capture_started.emit(capture)
-                self._stream_into(capture, stream, cfg)
+                capture = self._stream_into(capture, stream, cfg)
                 self.acquired.emit(capture)
-                if cfg.mode is TriggerMode.SINGLE or self._stop.is_set():
+                if cfg.mode in (TriggerMode.SINGLE, TriggerMode.ROLL) or self._stop.is_set():
                     break
                 if cfg.mode is TriggerMode.MANUAL:
                     psu.stop_fastlog(channels)
@@ -343,13 +361,14 @@ class InstrumentWorker(QObject):
             trackers={ch: GapTracker(cfg.rate.chunk_samples) for ch in channels},
             last_data=dict.fromkeys(channels), last_means={}, pending={ch: [] for ch in channels})
 
-    def _new_capture(self, cfg: RunConfig, interval: float, stream: _Stream, number: int) -> Capture:
+    def _new_capture(self, cfg: RunConfig, interval: float, stream: _Stream, number: int,
+                     capacity: int) -> Capture:
         channels = {}
         for setup in cfg.channels:
             s = self._psu.status(setup.channel, measure=False)
             settings = ChannelSettings(setup.channel, s.voltage_set, s.current_set, s.output,
                                        setup.voltage_range, setup.current_range)
-            channels[setup.channel] = ChannelData(settings, cfg.samples)
+            channels[setup.channel] = ChannelData(settings, capacity)
         first = stream.samples_streamed
         started = stream.started + timedelta(seconds=first * interval)
         capture = Capture(self._psu.info, cfg, interval, started, channels, number, first)
@@ -373,11 +392,55 @@ class InstrumentWorker(QObject):
             if used < len(item):
                 stream.pending[ch].append(item[used:])
 
-    def _stream_into(self, capture: Capture, stream: _Stream, cfg: RunConfig) -> None:
+    def _roll(self, capture: Capture, stream: _Stream, keep: int, final: bool = False) -> Capture:
+        """Roll mode: when the buffers are getting full, continue in new ones that start with the
+        last `keep` samples (or more). At the end of the run (final), trim to exactly those samples.
+
+        The new buffers are filled a step at a time while the old ones keep receiving data, because
+        copying a long span in one go would keep this thread from the instrument for longer than a
+        chunk lasts. Every channel drops the same number of samples, so they stay aligned. Returns
+        the capture to continue with: the same one until the new buffers have caught up.
+        """
+        if final:
+            stream.roll_next = None
+            drop = max(0, capture.n - keep)
+            channels = {ch: data.rolled(drop, capture.n - drop) for ch, data in capture.channels.items()}
+            return dataclasses.replace(capture, channels=channels, offset=capture.offset + drop)
+        if stream.roll_next is None:
+            slack = capture.target - keep
+            room = min(data.capacity - data.n for data in capture.channels.values())
+            if room > max(slack // 2, ROLL_SLACK_CHUNKS // 2 * stream.chunk_samples):
+                return capture
+            # Whole pyramid blocks, so the plotted envelope doesn't shift when the buffer rolls.
+            drop = max(0, capture.n - keep)
+            block = PYRAMID_BASE
+            while block * PYRAMID_FACTOR * 4 <= drop:
+                block *= PYRAMID_FACTOR
+            drop -= drop % block
+            if drop == 0:
+                return capture             # a channel is behind; its data, or the stall check, will come
+            stream.roll_drop = drop
+            stream.roll_next = {ch: ChannelData(data.settings, data.capacity)
+                                for ch, data in capture.channels.items()}
+        caught_up = [stream.roll_next[ch].copy_from(data, stream.roll_drop, ROLL_COPY_STEP)
+                     for ch, data in capture.channels.items()]
+        if not all(caught_up):
+            return capture
+        rolled = dataclasses.replace(capture, channels=stream.roll_next, offset=capture.offset + stream.roll_drop)
+        stream.roll_next = None
+        for ch in stream.channels:
+            pending, stream.pending[ch] = stream.pending[ch], []
+            for item in pending:
+                self._feed(rolled, stream, ch, item)
+        return rolled
+
+    def _stream_into(self, capture: Capture, stream: _Stream, cfg: RunConfig) -> Capture:
+        """Fill the capture from the stream. Returns it; in roll mode, the buffer the run ended with."""
         psu = self._psu
         channels = stream.channels
+        rolling = cfg.mode is TriggerMode.ROLL
         last_progress = last_status = time.monotonic()
-        while not capture.complete and not self._stop.is_set():
+        while not self._stop.is_set() and (rolling or not capture.complete):
             self._run_queued_commands(stream)
             ready = psu.poll(channels)
             t_poll = time.monotonic()
@@ -405,7 +468,13 @@ class InstrumentWorker(QObject):
                         self._emit_status(ch, stream)
             self._check_stall(stream, t_poll)
             now = time.monotonic()
-            if now - last_progress >= PROGRESS_PERIOD:
+            if rolling:
+                rolled = self._roll(capture, stream, cfg.samples)
+                if rolled is not capture or ready:      # every chunk: the display scrolls with the data
+                    capture = rolled
+                    last_progress = now
+                    self.progress.emit(capture)
+            elif now - last_progress >= PROGRESS_PERIOD:
                 last_progress = now
                 self.progress.emit(capture)
             if now - last_status >= LIVE_STATUS_PERIOD and stream.last_means:
@@ -414,6 +483,7 @@ class InstrumentWorker(QObject):
                     self._emit_status(ch, stream)
             if not ready:
                 time.sleep(POLL_INTERVAL)
+        return self._roll(capture, stream, cfg.samples, final=True) if rolling else capture
 
     def _check_stall(self, stream: _Stream, now: float) -> None:
         for ch in stream.channels:
