@@ -37,10 +37,18 @@ installation is needed. HiSLIP and VXI-11 go through pyvisa-py.
 .venv/bin/ngm-daq --resource 10.101.0.120
 ```
 
-1. Enter the NGM's IP address (or a full VISA resource string), or press **Scan**. Keep the
-   protocol on Socket unless you have a reason not to, then press **Connect**. Connecting
-   only reads: the channel panels show the instrument's setpoints, output states and ranges,
-   and nothing is sent until you change a control. Until then they show "—".
+1. The app looks for instruments on the LAN when it opens (about 2 s). The **Address** box
+   then shows the last instrument you used if it answered, else the first one found. The
+   Address list shows each instrument found with its model and serial number
+   (`10.101.0.120 — NGM202 · S/N 103062`); addresses used before that didn't answer are
+   greyed and marked "not found". Pick one, or type an IP address or a full VISA resource
+   string; **Scan** looks again. Looking sends the instruments no commands, so none is put
+   into Remote: model and serial come from the instruments' mDNS announcements or LXI
+   identification page.
+
+   Keep the protocol on Socket unless you have a reason not to, then press **Connect**.
+   Connecting only reads: the channel panels show the instrument's setpoints, output states
+   and ranges, and nothing is sent until you change a control. Until then they show "—".
 2. In each **Channel** panel:
    - **Voltage** and **Current limit** are sent when you press Enter or leave the field,
      and only if you changed them. The mouse wheel only adjusts a field you have clicked into.

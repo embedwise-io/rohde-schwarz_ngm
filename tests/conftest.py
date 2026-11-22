@@ -15,6 +15,13 @@ import ngm_simulator  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def no_lan_scan(monkeypatch):
+    """The window scans the LAN when it opens: find nothing, at once, unless a test says otherwise."""
+    from ngm_daq import discovery
+    monkeypatch.setattr(discovery, "discover", lambda rm=None, browse_time=None: [])
+
+
 @pytest.fixture(scope="session")
 def app():
     return QApplication.instance() or QApplication([])

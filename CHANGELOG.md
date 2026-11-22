@@ -2,6 +2,26 @@
 
 Notable changes to R&S NGM FastLog. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] — 2026-11-22
+
+### Added
+
+- **Instrument list, scanned at startup.** The app looks for instruments on the LAN when it
+  opens. The Address box shows the last instrument used if it answered, else the first one
+  found, else nothing, instead of an address that may no longer be there. The Address list
+  shows each instrument found with its model and serial number
+  (`10.101.0.120 — NGM202 · S/N 103062`); addresses used before that didn't answer are
+  greyed, marked "not found", with the identity last seen there. Picking an entry enters its
+  address. Looking sends no SCPI, so no instrument is put into Remote: identities come from
+  mDNS announcements (the NGM202 announces `_lxi` and `_scpi-raw` with its model and serial)
+  or the LXI identification page, alongside PyVISA's scan. Ported from the Keysight
+  digitizer app (its v1.1.2).
+
+### Also
+
+- Tests for the address list and discovery (mDNS, PyVISA and LXI page merged, no SCPI sent);
+  the window's startup scan is stubbed in tests (85 tests in total).
+
 ## [1.2.1] — 2026-11-22
 
 ### Fixed

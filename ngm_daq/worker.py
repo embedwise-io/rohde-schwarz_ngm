@@ -28,6 +28,7 @@ import pyvisa
 from PyQt6.QtCore import QObject, pyqtSignal as Signal
 from RsInstrument import RsInstrException, TimeoutException
 
+from . import discovery
 from .capture import (
     PYRAMID_BASE, PYRAMID_FACTOR, Capture, ChannelData, ChannelSettings, GapTracker, RunConfig, TriggerMode,
 )
@@ -86,7 +87,7 @@ class _Stream:
 
 
 class InstrumentWorker(QObject):
-    scanned = Signal(list)
+    scanned = Signal(list)                # list[discovery.FoundInstrument]
     connected = Signal(object)            # DeviceInfo
     disconnected = Signal()
     status = Signal(object)               # dict[int, ChannelStatus]
@@ -202,17 +203,13 @@ class InstrumentWorker(QObject):
     # --- Commands ------------------------------------------------------------------------
 
     def _do_scan(self) -> None:
+        """Find instruments and their identity, without sending them any command (see discovery)."""
         try:
-            found = pyvisa.ResourceManager("@py").list_resources("?*::INSTR")
+            found = discovery.discover(pyvisa.ResourceManager("@py"))
         except Exception as e:
             self.failed.emit("Scan failed", str(e), "")
-            found = ()
-        hosts = []
-        for resource in found:
-            parts = resource.split("::")
-            if parts[0].upper().startswith("TCPIP") and len(parts) > 1 and parts[1] not in hosts:
-                hosts.append(parts[1])
-        self.scanned.emit(hosts)
+            found = []
+        self.scanned.emit(found)
 
     def _do_open(self, resource: str, visa_select: str) -> None:
         self._close()

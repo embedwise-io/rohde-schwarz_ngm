@@ -13,7 +13,7 @@ import numpy as np
 import psutil
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, QSettings, QTimer, Qt, pyqtSignal as Signal, pyqtSlot as Slot
-from PyQt6.QtGui import QAction, QKeySequence, QShortcut, QTextDocument
+from PyQt6.QtGui import QAction, QColor, QKeySequence, QShortcut, QTextDocument
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGroupBox,
@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QSizePolicy, QSplitter, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
-from . import __version__, export
+from . import __version__, discovery, export
 from .capture import (
     PYRAMID_BASE, PYRAMID_FACTOR, QUANTITIES, UNITS, Capture, RunConfig, Stats, TriggerMode, merge_intervals,
     window_stats,
@@ -40,6 +40,7 @@ from .worker import ROLL_DISPLAY_MARGIN, ROLL_SLACK, InstrumentWorker, roll_capa
 
 APP_NAME = "R&S NGM FastLog"
 HISTORY_LENGTH = 10
+ADDRESS_SEPARATOR = " — "     # between an address and the instrument's identity in the Address list
 MISSING_COLOR = (255, 70, 70, 90)                  # translucent red: samples lost on the way
 CLIPPED_COLOR = (255, 200, 0, 70)                  # translucent amber: readings beyond the range
 EVENT_CONTEXT = 0.002                              # s: minimum view width when jumping to an event
@@ -287,7 +288,10 @@ class MainWindow(QMainWindow):
         self.info: DeviceInfo | None = None
         self.capture: Capture | None = None       # capture on display
         self.last_complete: Capture | None = None
-        self._busy = False                        # scanning, connecting, restarting
+        self._busy = False                        # connecting, restarting
+        self._scanning = False
+        self._scan_at_startup = False
+        self._cli_resource = resource             # an address given on the command line wins
         self._connecting = False                  # connecting, or restarting and reconnecting
         self._restarting = False
         self._running = False
@@ -305,6 +309,7 @@ class MainWindow(QMainWindow):
         self._restore_settings(resource, protocol)
         self._update_summary()
         self._update_controls()
+        self._on_scan(startup=True)               # so the Address box only offers instruments that answer
 
     # --- Construction --------------------------------------------------------------------
 
@@ -381,6 +386,7 @@ class MainWindow(QMainWindow):
         self.address.setMinimumContentsLength(15)
         self.address.view().setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.address.editTextChanged.connect(self._update_controls)
+        self.address.activated.connect(self._on_address_picked)
         form.addRow("Address", self.address)
         self.protocol = QComboBox()
         self.protocol.addItems(PROTOCOLS)
@@ -388,7 +394,8 @@ class MainWindow(QMainWindow):
                                  "Socket (port 5025) needs no VISA installation and is the fastest.")
         form.addRow("Protocol", self.protocol)
         self.scan_btn = QPushButton("Scan")
-        self.scan_btn.setToolTip("Discover LAN instruments (VXI-11 broadcast and mDNS)")
+        self.scan_btn.setToolTip("Look for instruments on the LAN again (mDNS and VXI-11 broadcast). The app also\n"
+                                 "looks when it opens. Sends them no commands, so nothing is put into Remote.")
         self.scan_btn.clicked.connect(self._on_scan)
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._on_connect)
@@ -700,9 +707,10 @@ class MainWindow(QMainWindow):
 
     def _restore_settings(self, resource: str | None, protocol: str | None) -> None:
         s = self.settings
-        history = s.value("history", [], list)
-        self.address.addItems(history)
-        self.address.setEditText(resource or (history[0] if history else ""))
+        for address in s.value("history", [], list):      # until the startup scan has checked them
+            self.address.addItem(self._address_label(address), address)
+        self._fit_address_list()
+        self.address.setEditText(resource or "")
         self.protocol.setCurrentText(protocol or s.value("protocol", PROTOCOLS[0], str))
         for ch, panel in self.channel_panels.items():
             panel.measure.setChecked(s.value(f"ch{ch}/measure", ch == 1, bool))
@@ -767,6 +775,40 @@ class MainWindow(QMainWindow):
         history = [text] + [h for h in self.settings.value("history", [], list) if h != text]
         self.settings.setValue("history", history[:HISTORY_LENGTH])
 
+    def _identities(self) -> dict[str, str]:
+        """The identity last seen at each host (from scans and connections), e.g. "NGM202 · S/N 103062"."""
+        pairs = (entry.split("|", 1) for entry in self.settings.value("identities", [], list) if "|" in entry)
+        return {host: identity for host, identity in pairs}
+
+    def _remember_identity(self, address: str, identity: str) -> None:
+        if not identity:
+            return
+        identities = self._identities()
+        identities[discovery.host_of(address)] = identity
+        self.settings.setValue("identities", [f"{h}|{i}" for h, i in identities.items()])
+
+    def _address_label(self, address: str, identity: str | None = None, found: bool = True) -> str:
+        identity = identity if identity is not None else self._identities().get(discovery.host_of(address), "")
+        parts = [identity] if identity else []
+        if not found:
+            parts.append("not found")
+        return ADDRESS_SEPARATOR.join([address, " · ".join(parts)]) if parts else address
+
+    def _fit_address_list(self) -> None:
+        """Let the Address list be wider than the box, so identities aren't cut short."""
+        view = self.address.view()
+        widest = max((view.fontMetrics().horizontalAdvance(self.address.itemText(i))
+                      for i in range(self.address.count())), default=0)
+        view.setMinimumWidth(widest + 2 * view.frameWidth() + view.verticalScrollBar().sizeHint().width() + 16)
+
+    def _address(self) -> str:
+        """The address typed or picked: the part before the identity, if a list entry's label is shown."""
+        return self.address.currentText().split(ADDRESS_SEPARATOR, 1)[0].strip()
+
+    def _on_address_picked(self, index: int) -> None:
+        if (address := self.address.itemData(index)) is not None:
+            self.address.setEditText(address)
+
     # --- State ---------------------------------------------------------------------------
 
     def measured_channels(self) -> list[int]:
@@ -786,16 +828,17 @@ class MainWindow(QMainWindow):
     def _update_controls(self) -> None:
         connected = self.info is not None
         idle = not self._busy and not self._running
-        self.address.setEnabled(idle and not connected)
-        self.scan_btn.setEnabled(idle and not connected)
-        self.protocol.setEnabled(idle and not connected and "::" not in self.address.currentText())
-        has_address = bool(self.address.currentText().strip())
+        self.address.setEnabled(idle and not connected and not self._scanning)
+        self.scan_btn.setEnabled(idle and not connected and not self._scanning)
+        self.protocol.setEnabled(idle and not connected and "::" not in self._address())
+        has_address = bool(self._address())
         if self._connecting:
             self.connect_btn.setText("Cancel")
             self.connect_btn.setEnabled(True)
         else:
             self.connect_btn.setText("Disconnect" if connected else "Connect")
-            self.connect_btn.setEnabled(not self._running and not self._busy and (connected or has_address))
+            self.connect_btn.setEnabled(not self._running and not self._busy and not self._scanning
+                                        and (connected or has_address))
         self.restart_btn.setEnabled(connected and idle)
         for ch, panel in self.channel_panels.items():
             present = self.info is None or ch in self.info.channels
@@ -873,24 +916,61 @@ class MainWindow(QMainWindow):
 
     # --- Instrument panel ----------------------------------------------------------------
 
-    def _on_scan(self) -> None:
-        self._set_busy(True)
-        self.statusBar().showMessage("Scanning for instruments…")
+    def _on_scan(self, startup: bool = False) -> None:
+        self._scanning = True
+        self._scan_at_startup = startup
+        if startup and not self._address():
+            self.address.lineEdit().setPlaceholderText("Looking for instruments…")
+        self.statusBar().showMessage("Looking for instruments…")
+        self._update_controls()
         self.worker.scan()
 
     @Slot(list)
-    def _on_scanned(self, hosts: list) -> None:
-        self._set_busy(False)
-        current = self.address.currentText()
-        existing = {self.address.itemText(i) for i in range(self.address.count())}
-        self.address.addItems([h for h in hosts if h not in existing])
-        self.address.setEditText(current or (hosts[0] if hosts else ""))
-        if hosts:
-            self.statusBar().showMessage(f"Found {len(hosts)} LAN instrument(s); pick one from the Address list.", 8000)
-            self.address.showPopup()
+    def _on_scanned(self, found: list) -> None:
+        """List the instruments that answered, with their identity, then remembered addresses that
+        didn't (greyed, "not found"). Choose an address that answered for the Address box."""
+        self._scanning = False
+        startup = self._scan_at_startup
+        self.address.lineEdit().setPlaceholderText("IP address, hostname, or VISA resource")
+        for f in found:
+            self._remember_identity(f.address, f.identity)
+        found_hosts = {discovery.host_of(f.address): f.address for f in found}
+        history = self.settings.value("history", [], list)
+        current = self._address()
+        self.address.blockSignals(True)
+        self.address.clear()
+        for f in found:
+            self.address.addItem(self._address_label(f.address, f.identity or None), f.address)
+        listed = set(found_hosts)
+        for address in history:
+            host = discovery.host_of(address)
+            if host in listed:
+                continue
+            listed.add(host)
+            self.address.addItem(self._address_label(address, found=False), address)
+            self.address.setItemData(self.address.count() - 1, QColor("gray"), Qt.ItemDataRole.ForegroundRole)
+        self.address.setCurrentIndex(-1)
+        self.address.blockSignals(False)
+        self._fit_address_list()
+        if self.info is not None or self._busy:
+            choice = current                     # connected or connecting: leave the address alone
+        elif startup and self._cli_resource:
+            choice = self._cli_resource
+        elif current and discovery.host_of(current) in found_hosts:
+            choice = found_hosts[discovery.host_of(current)]
+        else:
+            last = next((found_hosts[discovery.host_of(h)] for h in history if discovery.host_of(h) in found_hosts), None)
+            choice = last or (found[0].address if found else "")
+        self.address.setEditText(choice)
+        if found:
+            names = ", ".join(f.identity or f.address for f in found)
+            self.statusBar().showMessage(f"Found {len(found)} instrument{'s' if len(found) != 1 else ''}: {names}", 10000)
+            if not startup:
+                self.address.showPopup()
         else:
             self.statusBar().showMessage("No instruments found. Enter the NGM's IP address (instrument: "
                                          "Settings > Device > Interfaces > Network > LAN).", 10000)
+        self._update_controls()
 
     def _on_connect(self) -> None:
         if self.info is not None or self._connecting:
@@ -900,7 +980,7 @@ class MainWindow(QMainWindow):
             self._set_busy(True)
             self.worker.close_session()
             return
-        text = self.address.currentText().strip()
+        text = self._address()
         resource, visa = connection_for(text, self.protocol.currentText())
         self._connecting = True
         self._set_busy(True)
@@ -925,6 +1005,7 @@ class MainWindow(QMainWindow):
     def _on_connected(self, info: DeviceInfo) -> None:
         self.info = info
         self._connecting = self._restarting = False
+        self._remember_identity(info.resource, f"{info.model} · S/N {info.serial}")
         self.device_label.setText(info.summary())
         self.device_label.setToolTip(
             f"{info.manufacturer} {info.model} ({info.part_number})\nSerial {info.serial}\n"

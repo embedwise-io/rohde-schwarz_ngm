@@ -256,3 +256,87 @@ def test_roll_mode_left_edge_never_blank_after_a_rollover(app, window):
     assert blank == []
     assert win.capture.n == 2000                                        # Stop still keeps exactly the span
 
+
+# --- Address list ------------------------------------------------------------------------
+
+def scanned_window(app, tmp_path, monkeypatch, found, history, identities=(), resource=None):
+    from ngm_daq import discovery
+    monkeypatch.setattr(discovery, "discover", lambda rm=None, browse_time=None: list(found))
+    settings = QSettings(str(tmp_path / "addr.conf"), QSettings.Format.IniFormat)
+    settings.setValue("history", list(history))
+    settings.setValue("identities", [f"{h}|{i}" for h, i in identities])
+    w = MainWindow(resource, settings=settings)
+    w.show()
+    wait_for(app, lambda: not w._scanning)
+    return w
+
+
+def items(w):
+    return [(w.address.itemText(i), w.address.itemData(i),
+             w.address.itemData(i, Qt.ItemDataRole.ForegroundRole) is not None) for i in range(w.address.count())]
+
+
+def test_startup_scan_lists_instruments_with_their_identity(app, tmp_path, monkeypatch):
+    from ngm_daq.discovery import FoundInstrument
+    found = [FoundInstrument("10.101.0.120", "Rohde&Schwarz", "NGM202", "103062")]
+    w = scanned_window(app, tmp_path, monkeypatch, found,
+                       history=["10.101.0.121", "TCPIP::10.101.0.120::5025::SOCKET"],
+                       identities=[("10.101.0.121", "NGM201 · S/N 100001")])
+    try:
+        assert items(w) == [
+            ("10.101.0.120 — NGM202 · S/N 103062", "10.101.0.120", False),
+            ("10.101.0.121 — NGM201 · S/N 100001 · not found", "10.101.0.121", True),   # greyed
+        ]
+        # The last address used (10.101.0.121) didn't answer, so the box shows one that did.
+        assert w.address.currentText() == "10.101.0.120" and w.connect_btn.isEnabled()
+        w.address.setCurrentIndex(1)
+        w.address.activated.emit(1)                          # picking an entry puts just its address in
+        assert w.address.currentText() == "10.101.0.121" and w._address() == "10.101.0.121"
+    finally:
+        w.close()
+
+
+def test_startup_scan_prefers_the_last_instrument_used(app, tmp_path, monkeypatch):
+    from ngm_daq.discovery import FoundInstrument
+    found = [FoundInstrument("10.101.0.120", "Rohde&Schwarz", "NGM202", "103062"),
+             FoundInstrument("10.101.0.121", "Rohde&Schwarz", "NGM201", "100001")]
+    w = scanned_window(app, tmp_path, monkeypatch, found, history=["10.101.0.121", "10.101.0.120"])
+    try:
+        assert w.address.currentText() == "10.101.0.121"
+    finally:
+        w.close()
+
+
+def test_nothing_found_leaves_the_box_empty(app, tmp_path, monkeypatch):
+    w = scanned_window(app, tmp_path, monkeypatch, [], history=["10.101.0.120"])
+    try:
+        assert w.address.currentText() == "" and not w.connect_btn.isEnabled()
+        assert items(w) == [("10.101.0.120 — not found", "10.101.0.120", True)]
+    finally:
+        w.close()
+
+
+def test_command_line_address_wins(app, tmp_path, monkeypatch):
+    from ngm_daq.discovery import FoundInstrument
+    w = scanned_window(app, tmp_path, monkeypatch, [FoundInstrument("10.101.0.120", "Rohde&Schwarz", "NGM202", "X")],
+                       history=[], resource="10.101.0.99")
+    try:
+        assert w.address.currentText() == "10.101.0.99"
+    finally:
+        w.close()
+
+
+def test_connecting_records_the_identity(app, window):
+    win, _ = window
+    connect(app, win)
+    assert win._identities()["127.0.0.1"] == "NGM202 · S/N 000000"
+
+
+def test_a_scan_ending_during_a_connection_leaves_it_alone(app, window):
+    win, _ = window
+    address = win._address()
+    win._on_scan()                                           # scan and connect queued together
+    win._on_connect()
+    wait_for(app, lambda: win.info is not None and not win._scanning)
+    assert win.address.currentText() == address and win.connect_btn.text() == "Disconnect"
+    assert not win.address.isEnabled()
