@@ -36,7 +36,7 @@ from .plotting import (
     colored, format_time, si,
 )
 from .widgets import PopOutWindow, SetpointSpinBox, ToggleSwitch
-from .worker import ROLL_SLACK, InstrumentWorker, roll_capacity
+from .worker import ROLL_DISPLAY_MARGIN, ROLL_SLACK, InstrumentWorker, roll_capacity
 
 APP_NAME = "R&S NGM FastLog"
 HISTORY_LENGTH = 10
@@ -825,9 +825,10 @@ class MainWindow(QMainWindow):
         """
         budget = psutil.virtual_memory().available * MEMORY_FRACTION
         samples = budget / (BYTES_PER_SAMPLE * max(1, channels) * 2)
+        seconds = samples / rate.hz
         if mode is TriggerMode.ROLL:
-            samples /= (1 + ROLL_SLACK) * 1.2
-        return max(CHUNK_PERIOD, math.floor(samples / rate.hz * 100) / 100)
+            seconds = seconds / ((1 + ROLL_SLACK) * 1.2) - ROLL_DISPLAY_MARGIN
+        return max(CHUNK_PERIOD, math.floor(seconds * 100) / 100)
 
     def _roll_span(self) -> float:
         return self.timebase.currentData() * ROLL_DIVISIONS
@@ -857,7 +858,7 @@ class MainWindow(QMainWindow):
                 self.timebase.setCurrentIndex(max((i for i, ok in enumerate(fits) if ok), default=0))
             span = self._roll_span()
             samples = max(1, round(span * rate.hz))
-            size = roll_capacity(samples, rate.chunk_samples) * BYTES_PER_SAMPLE * channels
+            size = roll_capacity(samples, rate.chunk_samples, rate.hz) * BYTES_PER_SAMPLE * channels
             self.span_label.setText(f"span {format_span(span)}")
             self.summary.setText(
                 f"{samples:,} samples per channel · {si(size, 'B', 3)} in memory\n"

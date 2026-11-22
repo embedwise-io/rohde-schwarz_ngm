@@ -205,7 +205,7 @@ def test_roll_mode_scrolls_and_keeps_only_the_span(app, window, tmp_path):
     assert x1 - x0 == pytest.approx(1.0)                                # always the span ...
     assert cap.time_of(cap.n) - 0.7 < x1 <= cap.time_of(cap.n)          # ... ending just behind the newest sample
     assert not vb.state["mouseEnabled"][0] and vb.state["mouseEnabled"][1]
-    assert cap.target == 30_000                                         # bounded, however long it runs
+    assert cap.target == 40_000                                         # bounded, however long it runs
     assert win.plots["power"].getAxis("bottom").tickSpacing(x0, x1, 1000)[0][0] == pytest.approx(0.1)
     assert "CH1" in win.stats_label.text()                              # statistics follow while rolling
     assert not win.save_all_btn.isEnabled()
@@ -221,3 +221,38 @@ def test_roll_mode_scrolls_and_keeps_only_the_span(app, window, tmp_path):
     rows = [line for line in path.read_text().splitlines() if not line.startswith("#")]
     assert float(rows[1].split(",")[0]) == pytest.approx(cap.t0)        # times count from the start of the run
     assert f"# first_sample_index: {cap.offset}" in path.read_text()
+
+
+def test_roll_mode_left_edge_never_blank_after_a_rollover(app, window):
+    """The display runs behind the newest sample, so each rollover must keep more than the span:
+    otherwise the plots' left edge has no data behind it for a moment, which looks like a dropout."""
+    from ngm_daq.gui import ROLL_LATENCY
+    from ngm_daq.worker import ROLL_DISPLAY_MARGIN
+    assert ROLL_DISPLAY_MARGIN > ROLL_LATENCY
+    win, sim = window
+    configure_instrument(sim)
+    connect(app, win)
+    win.trigger_mode.setCurrentIndex(win.trigger_mode.findData(TriggerMode.ROLL))
+    win.rate.setCurrentIndex(win.rate.findData(SampleRate.R10K))
+    win.timebase.setCurrentIndex(win.timebase.findData(0.02))           # 0.2 s span: rolls every ~1.5 s
+    vb = win.plots["voltage"].getViewBox()
+    offsets, blank, frames = set(), [], 0
+    win._on_run()
+    deadline = time.monotonic() + 30
+    while len(offsets) < 4 and time.monotonic() < deadline:           # 3 rollovers
+        app.processEvents()
+        cap = win.capture
+        if cap is not None and win._capturing and cap.n:
+            x0 = vb.viewRange()[0][0]
+            if x0 >= 0:
+                frames += 1
+                offsets.add(cap.offset)
+                if cap.t0 > x0 + 1e-9:
+                    blank.append(cap.t0 - x0)
+        time.sleep(0.01)
+    win._on_run()
+    wait_for(app, lambda: not win._running)
+    assert len(offsets) >= 4 and frames > 100
+    assert blank == []
+    assert win.capture.n == 2000                                        # Stop still keeps exactly the span
+

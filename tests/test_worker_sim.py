@@ -188,11 +188,11 @@ def test_roll_mode_keeps_only_the_span(app, connected):
     wait_for(app, lambda: "finished" in rec.events)
     assert not [e for e in rec.events if isinstance(e, tuple)], rec.events
     # While running: bounded buffers that slide along the stream, never losing the span.
-    capacity = 5000 + 8 * 2500
+    capacity = 5000 + 10_000 + 8 * 2500                 # span + 1 s display margin + slack
     assert all(c.target == capacity for c in seen)
     offsets = [c.offset for c in seen]
     assert offsets == sorted(offsets) and len(set(offsets)) >= 3 and offsets[0] == 0
-    assert all(c.n >= 5000 for c in seen if c.offset)
+    assert all(c.n >= 5000 + 10_000 for c in seen if c.offset)      # a rolled buffer keeps span + margin
     # At the end: exactly the span, on both channels, ending where the stream ended.
     final = rec.captures[-1]
     assert final.n == 5000 and final.complete and final.offset >= 35_000

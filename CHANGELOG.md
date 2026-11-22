@@ -2,6 +2,20 @@
 
 Notable changes to R&S NGM FastLog. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-11-22
+
+### Fixed
+
+- **Roll mode: blank strip at the left edge.** The display runs 0.3 s behind the newest
+  sample, but when the buffer rolled it kept only the span, so for a moment after each
+  rollover the left edge of the plots had no data behind it (up to 0.3 s wide, in about a
+  third of the frames). The buffer now keeps an extra second when it rolls; Stop still keeps
+  exactly the span. Checked on an NGM202: no blank frames through 9 rollovers.
+
+### Also
+
+- A test checks the roll-mode left edge frame by frame across rollovers (76 tests in total).
+
 ## [1.2.0] — 2026-11-21
 
 ### Added

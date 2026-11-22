@@ -45,12 +45,21 @@ STALL_GIVE_UP = 5.0            # s without a chunk before giving up although Fas
 RESTART_WAIT = 120.0           # s to wait for the instrument to come back after SYST:RESTart
 ROLL_SLACK = 0.5               # roll buffer: room beyond the span, as a fraction of it
 ROLL_SLACK_CHUNKS = 8          # ... and at least this many chunks
+# s kept beyond the span when the buffer rolls. The display runs up to gui.ROLL_LATENCY behind the
+# newest sample (and the GUI may lag a little more), so keeping only the span would leave the left
+# edge of the plots blank for a moment after each rollover. Trimmed to the span when the run stops.
+ROLL_DISPLAY_MARGIN = 1.0
 ROLL_COPY_STEP = 1_000_000     # samples copied to the next roll buffer between polls (~10 ms per channel)
 
 
-def roll_capacity(span_samples: int, chunk_samples: int) -> int:
-    """Samples a roll-mode buffer holds: the span, plus slack so it rolls only now and then."""
-    return span_samples + max(int(span_samples * ROLL_SLACK), ROLL_SLACK_CHUNKS * chunk_samples)
+def roll_keep(span_samples: int, rate_hz: float) -> int:
+    """Samples a roll-mode buffer keeps when it rolls: the span plus the display margin."""
+    return span_samples + math.ceil(ROLL_DISPLAY_MARGIN * rate_hz)
+
+
+def roll_capacity(span_samples: int, chunk_samples: int, rate_hz: float) -> int:
+    """Samples a roll-mode buffer holds: what it keeps, plus slack so it rolls only now and then."""
+    return roll_keep(span_samples, rate_hz) + max(int(span_samples * ROLL_SLACK), ROLL_SLACK_CHUNKS * chunk_samples)
 
 
 class FastLogStopped(InstrumentError):
@@ -319,7 +328,7 @@ class InstrumentWorker(QObject):
                     stream = self._start_stream(channels, cfg)
                 number += 1
                 rolling = cfg.mode is TriggerMode.ROLL
-                capacity = roll_capacity(cfg.samples, stream.chunk_samples) if rolling else cfg.samples
+                capacity = roll_capacity(cfg.samples, stream.chunk_samples, cfg.rate.hz) if rolling else cfg.samples
                 capture = self._new_capture(cfg, interval, stream, number, capacity)
                 self.capture_started.emit(capture)
                 capture = self._stream_into(capture, stream, cfg)
@@ -469,7 +478,7 @@ class InstrumentWorker(QObject):
             self._check_stall(stream, t_poll)
             now = time.monotonic()
             if rolling:
-                rolled = self._roll(capture, stream, cfg.samples)
+                rolled = self._roll(capture, stream, roll_keep(cfg.samples, cfg.rate.hz))
                 if rolled is not capture or ready:      # every chunk: the display scrolls with the data
                     capture = rolled
                     last_progress = now
